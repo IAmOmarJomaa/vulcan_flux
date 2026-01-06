@@ -7,11 +7,12 @@ from torch.utils.checkpoint import checkpoint
 
 @dataclass
 class FluxParams:
+    class FluxParams:
+    mlp_ratio: float = 4.0
     in_channels: int
     vec_in_dim: int
     context_in_dim: int
     hidden_size: int
-    mlp_ratio: float
     num_heads: int
     depth: int
     depth_single_blocks: int
@@ -138,15 +139,29 @@ class SingleStreamBlock(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_heads = num_heads
-        self.linear1 = nn.Linear(hidden_size, hidden_size * 3 + hidden_size * 4, bias=True) # qkv + mlp
-        self.linear2 = nn.Linear(hidden_size, hidden_size, bias=True)
+        
+        # VULCAN MATH FIX:
+        # Checkpoint expects linear1 to be (3 * hidden) + (mlp_ratio * hidden)
+        # For Flux: (3 * 3072) + (4 * 3072) = 9216 + 12288 = 21504.
+        # BUT linear2 (the MLP output) specifically needs to handle the expanded hidden dim.
+        # Checkpoint shape [3072, 15360] means the input to linear2 is 15360.
+        
+        self.mlp_hidden_dim = int(hidden_size * mlp_ratio) # 12288
+        
+        # Linear1: QKV + MLP expansion
+        self.linear1 = nn.Linear(hidden_size, hidden_size * 3 + self.mlp_hidden_dim, bias=True)
+        
+        # Linear2: The specific layer causing the error. 
+        # Checkpoint says: "copying a param with shape [3072, 15360] from checkpoint"
+        # 15360 = 12288 (MLP) + 3072 (Residual/Context)
+        self.linear2 = nn.Linear(self.mlp_hidden_dim + hidden_size, hidden_size, bias=True)
+
         self.norm = QKNorm(hidden_size // num_heads)
         self.modulation = nn.Module()
         self.modulation.lin = nn.Linear(hidden_size, 3 * hidden_size, bias=True)
 
-    def forward(self, x: Tensor, vec: Tensor, pe: Tensor) -> Tensor:
-        mod, _ = self.modulation.lin(vec).chunk(2, dim=-1)
-        # Apply attention + MLP fused
+    def forward(self, x: torch.Tensor, vec: torch.Tensor, pe: torch.Tensor) -> torch.Tensor:
+        # Keep your existing forward logic here
         return x
 
 class LastLayer(nn.Module):
@@ -295,6 +310,9 @@ class Flux(nn.Module):
 
 # --- CONFIGS ---
 configs = {
+    "MODEL_NAME_DEV": FluxParams(
+        depth=19,
+        depth_single_blocks=38,),
     "dev": FluxParams(
         in_channels=64, vec_in_dim=768, context_in_dim=4096, hidden_size=3072, mlp_ratio=4.0,
         num_heads=24, depth=19, depth_single_blocks=38, axes_dim=[16, 56, 56], theta=10000, qkv_bias=True, guidance_embed=True
