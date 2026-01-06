@@ -56,3 +56,6 @@ class FluxTextEncoderOutputsCachingStrategy(strategy_base.TextEncoderOutputsCach
     def __init__(self, cache_to_disk, batch_size, skip_disk_check, is_partial, apply_t5_attn_mask):
         super().__init__(cache_to_disk, batch_size, skip_disk_check, is_partial)
         self.apply_t5_attn_mask = apply_t5_attn_mask
+        @property
+    def cache_suffix(self):
+        return "_te_outputs.npz"
