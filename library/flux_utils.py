@@ -1,3 +1,4 @@
+from huggingface_hub import hf_hub_download
 import torch
 import os
 from safetensors.torch import load_file
@@ -21,7 +22,19 @@ MODEL_NAME_SCHNELL = "schnell"
 MODEL_VERSION_CHROMA = "chroma"
 
 def analyze_checkpoint_state(ckpt_path: str) -> Tuple[bool, bool, Tuple[int, int], List[str]]:
-    # VULCAN FIX: Strip quotes if passed by messy shell commands
+    # VULCAN FIX: Auto-download from HF if not local
+    if not os.path.exists(ckpt_path) and not os.path.exists(os.path.join(ckpt_path, "transformer")):
+        logger.info(f"'{ckpt_path}' not found locally. Attempting HF download...")
+        try:
+            # Target the standard BFL file
+            ckpt_path = hf_hub_download(repo_id=ckpt_path, filename="flux1-dev.safetensors")
+            logger.info(f"Downloaded to: {ckpt_path}")
+        except Exception as e:
+            logger.warning(f"Download attempt failed: {e}. Assuming path is valid and hoping for the best...")
+
+    # Existing code continues below...
+    ckpt_path = ckpt_path.strip('"').strip("'")
+    # ...
     ckpt_path = ckpt_path.strip('"').strip("'")
     
     # VULCAN FIX: Handle directory paths for Kaggle
