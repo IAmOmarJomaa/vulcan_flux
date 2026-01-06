@@ -86,9 +86,10 @@ def load_flow_model(ckpt_path: str, dtype, device, disable_mmap=False, model_typ
         
         logger.info(f"Building Flux model {name} from {'Diffusers' if is_diffusers else 'BFL'} checkpoint")
         with torch.device("meta"):
-            params = flux_models.configs[name].params
-            if params.depth != num_double_blocks:
-                params = replace(params, depth=num_double_blocks)
+        # VULCAN FIX: Removed .params (the config object IS the params)
+        params = flux_models.configs[name] 
+        if params.depth != num_double_blocks:
+            params = replace(params, depth=num_double_blocks)
             if params.depth_single_blocks != num_single_blocks:
                 params = replace(params, depth_single_blocks=num_single_blocks)
             
