@@ -21,12 +21,11 @@ def add_flux_train_arguments(parser: argparse.ArgumentParser):
     parser.add_argument("--timestep_sampling", type=str, default="sigmoid", choices=["sigma", "uniform", "sigmoid", "shift"], help="timestep sampling method")
     parser.add_argument("--sigmoid_scale", type=float, default=1.0, help="sigmoid scale for timestep sampling")
     
-    # VULCAN FIX: These are already added by train_util.add_dit_training_arguments in the base library
-    # We check if they exist to avoid conflicts.
+    # VULCAN FIX: Comment out ALL conflicting arguments
     # parser.add_argument("--blocks_to_swap", type=int, default=None, help="number of blocks to swap")
     # parser.add_argument("--cpu_offload_checkpointing", action="store_true", help="offload checkpointing to CPU")
+    # parser.add_argument("--fp8_base_unet", action="store_true", help="use fp8 for base unet")
     
-    parser.add_argument("--fp8_base_unet", action="store_true", help="use fp8 for base unet")
     parser.add_argument("--split_mode", action="store_true", help="[Deprecated]")
 def get_noisy_model_input_and_timesteps(args, noise_scheduler, latents, noise, device, dtype):
     # Timestep sampling
