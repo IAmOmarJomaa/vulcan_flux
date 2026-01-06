@@ -1,5 +1,5 @@
 import torch
-import transformers  # <--- THIS WAS MISSING
+import transformers
 from typing import Optional, List, Any
 from . import strategy_base
 import logging
@@ -16,12 +16,10 @@ class FluxTokenizeStrategy(strategy_base.TokenizeStrategy):
         return tokenizer_class.from_pretrained(model_id, cache_dir=cache_dir)
 
     def tokenize(self, text: str):
-        # Tokenize for CLIP-L
         clip_tokens = self.clip_l(
             text, max_length=77, padding="max_length", truncation=True, return_tensors="pt"
         ).input_ids
 
-        # Tokenize for T5XXL
         t5_tokens = self.t5xxl(
             text, max_length=self.t5xxl_max_token_length, padding="max_length", truncation=True, return_tensors="pt"
         ).input_ids
@@ -33,21 +31,17 @@ class FluxTextEncodingStrategy(strategy_base.TextEncodingStrategy):
         self.apply_t5_attn_mask = apply_t5_attn_mask
 
     def encode_tokens(self, tokenize_strategy, models, tokens, apply_t5_attn_mask=False):
-        # Unpack models
         clip_l, t5xxl = models
         clip_tokens, t5_tokens = tokens
 
-        # Encode CLIP-L
         with torch.no_grad():
             l_pooled = clip_l(clip_tokens.to(clip_l.device))["pooler_output"]
 
-        # Encode T5XXL
         with torch.no_grad():
             t5_out = t5xxl(t5_tokens.to(t5xxl.device))["last_hidden_state"]
 
-        return [l_pooled, t5_out, t5_tokens, None] # Masks handled in trainer if needed
+        return [l_pooled, t5_out, t5_tokens, None]
 
-# Caching Strategies
 class FluxLatentsCachingStrategy(strategy_base.LatentsCachingStrategy):
     def __init__(self, cache_to_disk: bool, batch_size: int, skip_disk_check: bool):
         super().__init__(cache_to_disk, batch_size, skip_disk_check)
@@ -56,6 +50,7 @@ class FluxTextEncoderOutputsCachingStrategy(strategy_base.TextEncoderOutputsCach
     def __init__(self, cache_to_disk, batch_size, skip_disk_check, is_partial, apply_t5_attn_mask):
         super().__init__(cache_to_disk, batch_size, skip_disk_check, is_partial)
         self.apply_t5_attn_mask = apply_t5_attn_mask
-        @property
+
+    @property
     def cache_suffix(self):
         return "_te_outputs.npz"
