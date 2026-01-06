@@ -1,4 +1,5 @@
 import torch
+import transformers  # <--- THIS WAS MISSING
 from typing import Optional, List, Any
 from . import strategy_base
 import logging
@@ -12,7 +13,6 @@ class FluxTokenizeStrategy(strategy_base.TokenizeStrategy):
         self.t5xxl = self._load_tokenizer(transformers.T5Tokenizer, "google/t5-v1_1-xxl", tokenizer_cache_dir)
 
     def _load_tokenizer(self, tokenizer_class, model_id, cache_dir):
-        import transformers
         return tokenizer_class.from_pretrained(model_id, cache_dir=cache_dir)
 
     def tokenize(self, text: str):
