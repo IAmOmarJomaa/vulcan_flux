@@ -3,7 +3,6 @@ from typing import Tuple, List
 import os
 from safetensors.torch import load_file as load_safetensors
 from . import flux_models
-from .model_util import convert_diffusers_sd_to_bfl
 import logging
 from transformers import CLIPTextModel, CLIPConfig, T5EncoderModel, T5Config
 from huggingface_hub import hf_hub_download
@@ -13,6 +12,10 @@ logger = logging.getLogger(__name__)
 # Constants
 MODEL_NAME_DEV = "black-forest-labs/FLUX.1-dev"
 MODEL_NAME_SCHNELL = "black-forest-labs/FLUX.1-schnell"
+
+def convert_diffusers_sd_to_bfl(sd, num_double_blocks, num_single_blocks):
+    # Placeholder: We use BFL checkpoints, so conversion is not needed.
+    return sd
 
 def analyze_checkpoint_state(ckpt_path: str) -> Tuple[bool, bool, Tuple[int, int], List[str]]:
     # VULCAN FIX: Auto-download from HF if not local
