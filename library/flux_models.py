@@ -7,18 +7,19 @@ from torch.utils.checkpoint import checkpoint
 
 @dataclass
 class FluxParams:
-    mlp_ratio: float = 4.0
-    in_channels: int
-    vec_in_dim: int
-    context_dim: int = 4096
-    hidden_size: int
-    num_heads: int
+    # 1. Variables WITHOUT defaults first
     depth: int
     depth_single_blocks: int
-    axes_dim: list[int]
-    theta: int
-    qkv_bias: bool
-    guidance_embed: bool
+    num_heads: int
+    hidden_size: int
+    in_channels: int  # Moved this up so it has no default issues
+    vec_in_dim: int
+    context_dim: int
+    
+    # 2. Variables WITH defaults last
+    mlp_ratio: float = 4.0
+    qkv_bias: bool = True
+    guidance_embed: bool = False
 
 @dataclass
 class AutoEncoderParams:
@@ -132,23 +133,17 @@ class DoubleStreamBlock(nn.Module):
         # In full implementation, this applies scale/shift. 
         # For Skeleton Crew, ensuring shapes align is key.
         return img, txt 
-
 class SingleStreamBlock(nn.Module):
-    def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float, qkv_bias: bool = False):
+    def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float, qkv_bias: bool = True):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_heads = num_heads
-        
-        # This is the secret sauce:
-        # Checkpoint linear2 input = (hidden_size * mlp_ratio) + hidden_size
-        # 3072 * 4 + 3072 = 12288 + 3072 = 15360.
         self.mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        
+        self.linear1 = nn.Linear(hidden_size, hidden_size * 3 + self.mlp_hidden_dim, bias=qkv_bias)
         # linear1 output: QKV (3*hidden) + MLP expansion (4*hidden) = 21504
-        self.linear1 = nn.Linear(hidden_size, hidden_size * 3 + self.mlp_hidden_dim, bias=True)
         
         # linear2 input: MLP expansion + original hidden (context) = 15360
-        self.linear2 = nn.Linear(self.mlp_hidden_dim + hidden_size, hidden_size, bias=True)
+        self.linear2 = nn.Linear(self.mlp_hidden_dim + hidden_size, hidden_size, bias=qkv_bias)
 
         self.norm = QKNorm(hidden_size // num_heads)
         # ... rest of the class
