@@ -45,6 +45,11 @@ class FluxTextEncodingStrategy(strategy_base.TextEncodingStrategy):
 class FluxLatentsCachingStrategy(strategy_base.LatentsCachingStrategy):
     def __init__(self, cache_to_disk: bool, batch_size: int, skip_disk_check: bool):
         super().__init__(cache_to_disk, batch_size, skip_disk_check)
+    
+    # --- THIS WAS MISSING ---
+    @property
+    def cache_suffix(self):
+        return ".npz"
 
 class FluxTextEncoderOutputsCachingStrategy(strategy_base.TextEncoderOutputsCachingStrategy):
     def __init__(self, cache_to_disk, batch_size, skip_disk_check, is_partial, apply_t5_attn_mask):
