@@ -10,6 +10,9 @@ import logging
 logger = logging.getLogger(__name__)
 
 def add_flux_train_arguments(parser: argparse.ArgumentParser):
+    # --- Add this line right at the top of the function ---
+    parser.add_argument("--model_type", type=str, default="flux", help="Model type: flux or chroma")
+
     parser.add_argument("--ae", type=str, default=None, help="path to AE/VAE model")
     parser.add_argument("--clip_l", type=str, default=None, help="path to CLIP-L model")
     parser.add_argument("--t5xxl", type=str, default=None, help="path to T5XXL model")
@@ -21,7 +24,7 @@ def add_flux_train_arguments(parser: argparse.ArgumentParser):
     parser.add_argument("--timestep_sampling", type=str, default="sigmoid", choices=["sigma", "uniform", "sigmoid", "shift"], help="timestep sampling method")
     parser.add_argument("--sigmoid_scale", type=float, default=1.0, help="sigmoid scale for timestep sampling")
     
-    # VULCAN FIX: Comment out ALL conflicting arguments
+    # VULCAN FIX: Keep these commented out to avoid collisions
     # parser.add_argument("--blocks_to_swap", type=int, default=None, help="number of blocks to swap")
     # parser.add_argument("--cpu_offload_checkpointing", action="store_true", help="offload checkpointing to CPU")
     # parser.add_argument("--fp8_base_unet", action="store_true", help="use fp8 for base unet")
