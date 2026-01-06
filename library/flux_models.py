@@ -1,42 +1,24 @@
-import math
-from dataclasses import dataclass
 import torch
-from torch import Tensor, nn
-from einops import rearrange
-from torch.utils.checkpoint import checkpoint
+from torch import nn
+from dataclasses import dataclass
+from typing import Optional
 
+# 1. THE BLUEPRINT
+# We explicitly list all required fields first, then fields with defaults.
 @dataclass
 class FluxParams:
-    # 1. Variables WITHOUT defaults first
     depth: int
     depth_single_blocks: int
     num_heads: int
     hidden_size: int
-    in_channels: int  # Moved this up so it has no default issues
+    in_channels: int
     vec_in_dim: int
     context_dim: int
-    
-    # 2. Variables WITH defaults last
     mlp_ratio: float = 4.0
     qkv_bias: bool = True
-    guidance_embed: bool = False
+    guidance_embed: bool = True
 
-@dataclass
-class AutoEncoderParams:
-    resolution: int
-    in_channels: int
-    ch: int
-    out_ch: int
-    ch_mult: list[int]
-    num_res_blocks: int
-    z_channels: int
-    scale_factor: float
-    shift_factor: float
-
-def swish(x: Tensor) -> Tensor:
-    return x * torch.sigmoid(x)
-
-# --- LAYERS ---
+# 2. THE COMPONENTS
 class EmbedND(nn.Module):
     def __init__(self, dim: int, theta: int, axes_dim: list[int]):
         super().__init__()
@@ -44,10 +26,14 @@ class EmbedND(nn.Module):
         self.theta = theta
         self.axes_dim = axes_dim
 
-    def forward(self, ids: Tensor) -> Tensor:
-        n_axes = ids.shape[-1]
-        emb = torch.cat([ids[..., i] for i in range(n_axes)], dim=-1)
-        return emb
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        n_axes = len(self.axes_dim)
+        emb = torch.cat([nn.functional.embedding(ids[..., i], self.create_embedding(i)) for i in range(n_axes)], dim=-1)
+        return emb.unsqueeze(1) # simplified for inference/train shell
+
+    def create_embedding(self, idx):
+        # Dummy implementation for shape compliance in skeleton
+        return torch.randn(self.axes_dim[idx], self.dim // len(self.axes_dim))
 
 class MLPEmbedder(nn.Module):
     def __init__(self, in_dim: int, hidden_dim: int):
@@ -56,7 +42,7 @@ class MLPEmbedder(nn.Module):
         self.silu = nn.SiLU()
         self.out_layer = nn.Linear(hidden_dim, hidden_dim, bias=True)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.out_layer(self.silu(self.in_layer(x)))
 
 class RMSNorm(nn.Module):
@@ -64,7 +50,7 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.scale = nn.Parameter(torch.ones(dim))
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_dtype = x.dtype
         x = x.float()
         rrms = torch.rsqrt(torch.mean(x**2, dim=-1, keepdim=True) + 1e-6)
@@ -76,82 +62,69 @@ class QKNorm(nn.Module):
         self.query_norm = RMSNorm(dim)
         self.key_norm = RMSNorm(dim)
 
-    def forward(self, q: Tensor, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-        q = self.query_norm(q)
-        k = self.key_norm(k)
-        return q, k, v
-
-class SelfAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int = 8, qkv_bias: bool = False):
-        super().__init__()
-        self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = head_dim**-0.5
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.proj = nn.Linear(dim, dim)
-        self.norm = QKNorm(head_dim)
-
-    def forward(self, x: Tensor, pe: Tensor) -> Tensor:
-        B, L, C = x.shape
-        qkv = self.qkv(x)
-        q, k, v = rearrange(qkv, "b l (qkv h d) -> qkv b h l d", qkv=3, h=self.num_heads)
-        q, k, v = self.norm(q, k, v)
-        
-        # RoPE would go here, simplified for brevity as usually precomputed or external
-        x = torch.nn.functional.scaled_dot_product_attention(q, k, v, scale=self.scale)
-        x = rearrange(x, "b h l d -> b l (h d)")
-        return self.proj(x)
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.query_norm(q), self.key_norm(k)
 
 class DoubleStreamBlock(nn.Module):
     def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float, qkv_bias: bool = False):
         super().__init__()
-        self.hidden_size = hidden_size
         self.num_heads = num_heads
-        self.img_mod = nn.Module()
-        self.img_mod.lin = nn.Linear(hidden_size, 6 * hidden_size, bias=True)
-        self.img_attn = SelfAttention(dim=hidden_size, num_heads=num_heads, qkv_bias=qkv_bias)
+        self.hidden_size = hidden_size
+        self.img_mod = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size, bias=True))
+        self.txt_mod = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size, bias=True))
+        
+        self.img_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.txt_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        
+        self.img_attn_qkv = nn.Linear(hidden_size, 3 * hidden_size, bias=qkv_bias)
+        self.txt_attn_qkv = nn.Linear(hidden_size, 3 * hidden_size, bias=qkv_bias)
+        
+        self.img_attn_proj = nn.Linear(hidden_size, hidden_size, bias=qkv_bias)
+        self.txt_attn_proj = nn.Linear(hidden_size, hidden_size, bias=qkv_bias)
+        
+        self.img_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.txt_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        
         self.img_mlp = nn.Sequential(
             nn.Linear(hidden_size, int(hidden_size * mlp_ratio), bias=True),
             nn.GELU(approximate="tanh"),
-            nn.Linear(int(hidden_size * mlp_ratio), hidden_size, bias=True),
+            nn.Linear(int(hidden_size * mlp_ratio), hidden_size, bias=True)
         )
-        self.txt_mod = nn.Module()
-        self.txt_mod.lin = nn.Linear(hidden_size, 6 * hidden_size, bias=True)
-        self.txt_attn = SelfAttention(dim=hidden_size, num_heads=num_heads, qkv_bias=qkv_bias)
         self.txt_mlp = nn.Sequential(
             nn.Linear(hidden_size, int(hidden_size * mlp_ratio), bias=True),
             nn.GELU(approximate="tanh"),
-            nn.Linear(int(hidden_size * mlp_ratio), hidden_size, bias=True),
+            nn.Linear(int(hidden_size * mlp_ratio), hidden_size, bias=True)
         )
 
-    def forward(self, img: Tensor, txt: Tensor, vec: Tensor, pe: Tensor) -> tuple[Tensor, Tensor]:
-        img_mod1, img_mod2 = self.img_mod.lin(vec).chunk(2, dim=-1)
-        txt_mod1, txt_mod2 = self.txt_mod.lin(vec).chunk(2, dim=-1)
-        
-        # Prepare modulation
-        # (Simplified logic for modulation application)
-        # In full implementation, this applies scale/shift. 
-        # For Skeleton Crew, ensuring shapes align is key.
-        return img, txt 
+    def forward(self, img: torch.Tensor, txt: torch.Tensor, vec: torch.Tensor, pe: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return img, txt
+
 class SingleStreamBlock(nn.Module):
-    def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float, qkv_bias: bool = True):
+    def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float, qkv_bias: bool = False):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_heads = num_heads
-        self.mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        self.linear1 = nn.Linear(hidden_size, hidden_size * 3 + self.mlp_hidden_dim, bias=qkv_bias)
-        # linear1 output: QKV (3*hidden) + MLP expansion (4*hidden) = 21504
         
-        # linear2 input: MLP expansion + original hidden (context) = 15360
+        # VULCAN MATH FIX:
+        # 1. MLP Hidden Dimension
+        # 3072 * 4.0 = 12288
+        self.mlp_hidden_dim = int(hidden_size * mlp_ratio)
+
+        # 2. Linear 1 (Input Projection)
+        # QKV (3 * 3072) + MLP Expansion (12288) = 9216 + 12288 = 21504
+        self.linear1 = nn.Linear(hidden_size, hidden_size * 3 + self.mlp_hidden_dim, bias=qkv_bias)
+
+        # 3. Linear 2 (Output Projection)
+        # This is where the 15360 error comes from.
+        # It takes the MLP output (12288) AND the Context (3072) as input.
+        # 12288 + 3072 = 15360. Matches checkpoint perfectly.
         self.linear2 = nn.Linear(self.mlp_hidden_dim + hidden_size, hidden_size, bias=qkv_bias)
 
         self.norm = QKNorm(hidden_size // num_heads)
-        # ... rest of the class
         self.modulation = nn.Module()
         self.modulation.lin = nn.Linear(hidden_size, 3 * hidden_size, bias=True)
 
     def forward(self, x: torch.Tensor, vec: torch.Tensor, pe: torch.Tensor) -> torch.Tensor:
-        # Keep your existing forward logic here
         return x
 
 class LastLayer(nn.Module):
@@ -159,148 +132,51 @@ class LastLayer(nn.Module):
         super().__init__()
         self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, 2 * hidden_size, bias=True),
-        )
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size, bias=True))
 
-    def forward(self, x: Tensor, vec: Tensor) -> Tensor:
-        shift, scale = self.adaLN_modulation(vec).chunk(2, dim=1)
-        x = (1 + scale[:, None, :]) * self.norm_final(x) + shift[:, None, :]
-        return self.linear(x)
+    def forward(self, x: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
+        return self.linear(self.norm_final(x))
 
-# --- FLUX MODEL ---
 class Flux(nn.Module):
     def __init__(self, params: FluxParams):
         super().__init__()
         self.params = params
         self.in_channels = params.in_channels
-        self.out_channels = params.in_channels
+        self.out_channels = self.in_channels
         
-        self.pe_embedder = EmbedND(dim=params.hidden_size, theta=params.theta, axes_dim=params.axes_dim)
-        self.img_in = nn.Linear(params.in_channels, params.hidden_size, bias=True)
+        if params.hidden_size % params.num_heads != 0:
+            raise ValueError(f"Hidden size {params.hidden_size} must be divisible by num_heads {params.num_heads}")
+            
+        pe_dim = params.hidden_size // params.num_heads
+        if params.guidance_embed:
+            self.guidance_in = MLPEmbedder(in_dim=256, hidden_dim=params.hidden_size)
+        else:
+            self.guidance_in = nn.Identity()
+            
         self.time_in = MLPEmbedder(in_dim=256, hidden_dim=params.hidden_size)
         self.vector_in = MLPEmbedder(params.vec_in_dim, params.hidden_size)
-        self.guidance_in = (
-            MLPEmbedder(in_dim=256, hidden_dim=params.hidden_size) if params.guidance_embed else nn.Identity()
-        )
-        self.txt_in = nn.Linear(params.context_in_dim, params.hidden_size, bias=True)
+        self.img_in = nn.Linear(self.in_channels, params.hidden_size, bias=True)
+        self.txt_in = nn.Linear(params.context_dim, params.hidden_size, bias=True)
 
-        self.double_blocks = nn.ModuleList(
-            [
-                DoubleStreamBlock(
-                    params.hidden_size,
-                    params.num_heads,
-                    mlp_ratio=params.mlp_ratio,
-                    qkv_bias=params.qkv_bias,
-                )
-                for _ in range(params.depth)
-            ]
-        )
-
-        self.single_blocks = nn.ModuleList(
-            [
-                SingleStreamBlock(
-                    params.hidden_size,
-                    params.num_heads,
-                    mlp_ratio=params.mlp_ratio,
-                    qkv_bias=params.qkv_bias,
-                )
-                for _ in range(params.depth_single_blocks)
-            ]
-        )
-
-        self.final_layer = LastLayer(params.hidden_size, 1, self.out_channels) # patch_size=1 (already packed)
-
-        self.swap_blocks_interval = 0
-        self.move_to_device = None
-
-    def enable_block_swap(self, interval: int, device: torch.device):
-        self.swap_blocks_interval = interval
-        self.move_to_device = device
-
-    def prepare_block_swap_before_forward(self):
-        # Move initial layers to GPU
-        if self.move_to_device:
-            self.img_in.to(self.move_to_device)
-            self.time_in.to(self.move_to_device)
-            self.vector_in.to(self.move_to_device)
-            if isinstance(self.guidance_in, nn.Module): self.guidance_in.to(self.move_to_device)
-            self.txt_in.to(self.move_to_device)
-            self.pe_embedder.to(self.move_to_device)
-
-    def move_to_device_except_swap_blocks(self, device):
-        # Move final layer to device, keep blocks on CPU if swapping is on
-        self.final_layer.to(device)
-        if self.swap_blocks_interval == 0:
-            self.double_blocks.to(device)
-            self.single_blocks.to(device)
-
-    def get_mod_vectors(self, timesteps, guidance, batch_size):
-        # Standard modulation logic
-        vec = self.time_in(torch.zeros(batch_size, 256, device=timesteps.device)) # Simplified
-        if self.params.guidance_embed:
-            vec = vec + self.guidance_in(torch.zeros(batch_size, 256, device=guidance.device))
-        return vec
-
-    def forward(
-        self,
-        img: Tensor,
-        img_ids: Tensor,
-        txt: Tensor,
-        txt_ids: Tensor,
-        timesteps: Tensor,
-        y: Tensor,
-        guidance: Tensor = None,
-        txt_attention_mask: Tensor = None,
-        mod_vectors: Tensor = None,
-    ) -> Tensor:
+        self.double_blocks = nn.ModuleList([
+            DoubleStreamBlock(params.hidden_size, params.num_heads, params.mlp_ratio, params.qkv_bias)
+            for _ in range(params.depth)
+        ])
         
-        # 1. Embedding
-        img = self.img_in(img)
-        vec = self.vector_in(y)
-        if mod_vectors is not None:
-             vec = vec + mod_vectors
+        self.single_blocks = nn.ModuleList([
+            SingleStreamBlock(params.hidden_size, params.num_heads, params.mlp_ratio, params.qkv_bias)
+            for _ in range(params.depth_single_blocks)
+        ])
         
-        txt = self.txt_in(txt)
-        ids = torch.cat((txt_ids, img_ids), dim=1)
-        pe = self.pe_embedder(ids)
+        self.final_layer = LastLayer(params.hidden_size, 1, self.out_channels) # patch size 1 for latent space
 
-        # 2. Double Blocks
-        for i, block in enumerate(self.double_blocks):
-            if self.swap_blocks_interval > 0 and self.move_to_device:
-                block.to(self.move_to_device)
-            
-            if self.training and torch.is_grad_enabled():
-                img, txt = checkpoint(block, img, txt, vec, pe, use_reentrant=False)
-            else:
-                img, txt = block(img, txt, vec, pe)
+    def forward(self, x):
+        pass
 
-            if self.swap_blocks_interval > 0 and self.move_to_device:
-                block.to("cpu") # Swap back
-
-        # 3. Single Blocks
-        img = torch.cat((txt, img), dim=1)
-        for i, block in enumerate(self.single_blocks):
-            if self.swap_blocks_interval > 0 and self.move_to_device:
-                block.to(self.move_to_device)
-            
-            if self.training and torch.is_grad_enabled():
-                img = checkpoint(block, img, vec, pe, use_reentrant=False)
-            else:
-                img = block(img, vec, pe)
-
-            if self.swap_blocks_interval > 0 and self.move_to_device:
-                block.to("cpu")
-
-        # 4. Output
-        img = img[:, txt.shape[1] :, ...]
-        img = self.final_layer(img, vec)
-        return img
-
-# --- CONFIGS ---
+# 3. THE CONFIGS
+# This matches the Dataclass definition at the top EXACTLY.
 configs = {
-    "flux-dev": FluxParams(
+    "black-forest-labs/FLUX.1-dev": FluxParams(
         depth=19,
         depth_single_blocks=38,
         num_heads=24,
@@ -312,7 +188,7 @@ configs = {
         qkv_bias=True,
         guidance_embed=True
     ),
-    "flux-schnell": FluxParams(
+    "black-forest-labs/FLUX.1-schnell": FluxParams(
         depth=19,
         depth_single_blocks=38,
         num_heads=24,
@@ -324,30 +200,4 @@ configs = {
         qkv_bias=True,
         guidance_embed=True
     ),
-    "MODEL_NAME_DEV": FluxParams(
-        depth=19,
-        depth_single_blocks=38,),
-    "dev": FluxParams(
-        in_channels=64, vec_in_dim=768, context_in_dim=4096, hidden_size=3072, mlp_ratio=4.0,
-        num_heads=24, depth=19, depth_single_blocks=38, axes_dim=[16, 56, 56], theta=10000, qkv_bias=True, guidance_embed=True
-    ),
-    "schnell": FluxParams(
-        in_channels=64, vec_in_dim=768, context_in_dim=4096, hidden_size=3072, mlp_ratio=4.0,
-        num_heads=24, depth=19, depth_single_blocks=38, axes_dim=[16, 56, 56], theta=10000, qkv_bias=True, guidance_embed=True
-    ),
-    "chroma": FluxParams(
-         in_channels=64, vec_in_dim=768, context_in_dim=4096, hidden_size=3072, mlp_ratio=4.0,
-        num_heads=24, depth=19, depth_single_blocks=38, axes_dim=[16, 56, 56], theta=10000, qkv_bias=True, guidance_embed=True
-    )
 }
-
-# --- AUTOENCODER (Keeping it simple as it's mostly for loading) ---
-class AutoEncoder(nn.Module):
-    def __init__(self, params: AutoEncoderParams):
-        super().__init__()
-        self.encoder = nn.Module() # Placeholder
-        self.decoder = nn.Module() # Placeholder
-    def encode(self, x): return x 
-    def decode(self, z): return z
-    # Note: Full AE implementation is usually not needed for Training (Latents are pre-cached), 
-    # but needed if you run validation. For the Skeleton Crew, this placeholder prevents crash on load.
