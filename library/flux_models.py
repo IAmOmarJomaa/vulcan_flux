@@ -300,6 +300,30 @@ class Flux(nn.Module):
 
 # --- CONFIGS ---
 configs = {
+    "flux-dev": FluxParams(
+        depth=19,
+        depth_single_blocks=38,
+        num_heads=24,
+        hidden_size=3072,
+        in_channels=64,
+        vec_in_dim=768,
+        context_dim=4096,
+        mlp_ratio=4.0,
+        qkv_bias=True,
+        guidance_embed=True
+    ),
+    "flux-schnell": FluxParams(
+        depth=19,
+        depth_single_blocks=38,
+        num_heads=24,
+        hidden_size=3072,
+        in_channels=64,
+        vec_in_dim=768,
+        context_dim=4096,
+        mlp_ratio=4.0,
+        qkv_bias=True,
+        guidance_embed=True
+    ),
     "MODEL_NAME_DEV": FluxParams(
         depth=19,
         depth_single_blocks=38,),
