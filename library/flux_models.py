@@ -7,11 +7,10 @@ from torch.utils.checkpoint import checkpoint
 
 @dataclass
 class FluxParams:
-    class FluxParams:
     mlp_ratio: float = 4.0
     in_channels: int
     vec_in_dim: int
-    context_in_dim: int
+    context_dim: int = 4096
     hidden_size: int
     num_heads: int
     depth: int
@@ -140,23 +139,19 @@ class SingleStreamBlock(nn.Module):
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         
-        # VULCAN MATH FIX:
-        # Checkpoint expects linear1 to be (3 * hidden) + (mlp_ratio * hidden)
-        # For Flux: (3 * 3072) + (4 * 3072) = 9216 + 12288 = 21504.
-        # BUT linear2 (the MLP output) specifically needs to handle the expanded hidden dim.
-        # Checkpoint shape [3072, 15360] means the input to linear2 is 15360.
+        # This is the secret sauce:
+        # Checkpoint linear2 input = (hidden_size * mlp_ratio) + hidden_size
+        # 3072 * 4 + 3072 = 12288 + 3072 = 15360.
+        self.mlp_hidden_dim = int(hidden_size * mlp_ratio)
         
-        self.mlp_hidden_dim = int(hidden_size * mlp_ratio) # 12288
-        
-        # Linear1: QKV + MLP expansion
+        # linear1 output: QKV (3*hidden) + MLP expansion (4*hidden) = 21504
         self.linear1 = nn.Linear(hidden_size, hidden_size * 3 + self.mlp_hidden_dim, bias=True)
         
-        # Linear2: The specific layer causing the error. 
-        # Checkpoint says: "copying a param with shape [3072, 15360] from checkpoint"
-        # 15360 = 12288 (MLP) + 3072 (Residual/Context)
+        # linear2 input: MLP expansion + original hidden (context) = 15360
         self.linear2 = nn.Linear(self.mlp_hidden_dim + hidden_size, hidden_size, bias=True)
 
         self.norm = QKNorm(hidden_size // num_heads)
+        # ... rest of the class
         self.modulation = nn.Module()
         self.modulation.lin = nn.Linear(hidden_size, 3 * hidden_size, bias=True)
 
