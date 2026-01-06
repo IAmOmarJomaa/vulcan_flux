@@ -85,11 +85,13 @@ def load_flow_model(ckpt_path: str, dtype, device, disable_mmap=False, model_typ
         name = MODEL_NAME_DEV if not is_schnell else MODEL_NAME_SCHNELL
         
         logger.info(f"Building Flux model {name} from {'Diffusers' if is_diffusers else 'BFL'} checkpoint")
+        
         with torch.device("meta"):
-        # VULCAN FIX: Removed .params (the config object IS the params)
-        params = flux_models.configs[name] 
-        if params.depth != num_double_blocks:
-            params = replace(params, depth=num_double_blocks)
+            # VULCAN FIX: Removed .params (the config object IS the params)
+            # This line MUST be indented under 'with'
+            params = flux_models.configs[name] 
+            if params.depth != num_double_blocks:
+                params = replace(params, depth=num_double_blocks)
             if params.depth_single_blocks != num_single_blocks:
                 params = replace(params, depth_single_blocks=num_single_blocks)
             
@@ -106,17 +108,20 @@ def load_flow_model(ckpt_path: str, dtype, device, disable_mmap=False, model_typ
             logger.info("Converting Diffusers to BFL")
             sd = convert_diffusers_sd_to_bfl(sd, num_double_blocks, num_single_blocks)
 
-        # VULCAN CRITICAL FIX: The "Ghost Model" Prefix Stripper (Flux)
+        # VULCAN CRITICAL FIX: The "Ghost Model" Prefix Stripper
         keys_to_rename = [k for k in sd.keys() if k.startswith("model.diffusion_model.")]
         for key in keys_to_rename:
             new_key = key.replace("model.diffusion_model.", "")
             sd[new_key] = sd.pop(key)
+        
         if keys_to_rename:
-            logger.info(f"Sanitized {len(keys_to_rename)} keys (Flux mode).")
+            logger.info(f"Sanitized {len(keys_to_rename)} keys.")
 
         info = model.load_state_dict(sd, strict=False, assign=True)
         logger.info(f"Loaded Flux: {info}")
         return is_schnell, model
+
+    # ... keep the rest of the chroma/error logic below as is ...
 
     elif model_type == "chroma":
         from . import chroma_models
