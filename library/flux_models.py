@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from typing import Optional
 
 # 1. THE BLUEPRINT
-# We explicitly list all required fields first, then fields with defaults.
 @dataclass
 class FluxParams:
     depth: int
@@ -29,10 +28,9 @@ class EmbedND(nn.Module):
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
         n_axes = len(self.axes_dim)
         emb = torch.cat([nn.functional.embedding(ids[..., i], self.create_embedding(i)) for i in range(n_axes)], dim=-1)
-        return emb.unsqueeze(1) # simplified for inference/train shell
+        return emb.unsqueeze(1)
 
     def create_embedding(self, idx):
-        # Dummy implementation for shape compliance in skeleton
         return torch.randn(self.axes_dim[idx], self.dim // len(self.axes_dim))
 
 class MLPEmbedder(nn.Module):
@@ -106,18 +104,9 @@ class SingleStreamBlock(nn.Module):
         self.num_heads = num_heads
         
         # VULCAN MATH FIX:
-        # 1. MLP Hidden Dimension
-        # 3072 * 4.0 = 12288
         self.mlp_hidden_dim = int(hidden_size * mlp_ratio)
-
-        # 2. Linear 1 (Input Projection)
-        # QKV (3 * 3072) + MLP Expansion (12288) = 9216 + 12288 = 21504
         self.linear1 = nn.Linear(hidden_size, hidden_size * 3 + self.mlp_hidden_dim, bias=qkv_bias)
-
-        # 3. Linear 2 (Output Projection)
-        # This is where the 15360 error comes from.
-        # It takes the MLP output (12288) AND the Context (3072) as input.
-        # 12288 + 3072 = 15360. Matches checkpoint perfectly.
+        # 15360 Fix
         self.linear2 = nn.Linear(self.mlp_hidden_dim + hidden_size, hidden_size, bias=qkv_bias)
 
         self.norm = QKNorm(hidden_size // num_heads)
@@ -168,15 +157,14 @@ class Flux(nn.Module):
             for _ in range(params.depth_single_blocks)
         ])
         
-        self.final_layer = LastLayer(params.hidden_size, 1, self.out_channels) # patch size 1 for latent space
+        self.final_layer = LastLayer(params.hidden_size, 1, self.out_channels)
 
     def forward(self, x):
         pass
 
-# 3. THE CONFIGS
-# This matches the Dataclass definition at the top EXACTLY.
+# 3. THE CONFIGS (CORRECT KEYS)
 configs = {
-    "black-forest-labs/FLUX.1-dev": FluxParams(
+    "dev": FluxParams(
         depth=19,
         depth_single_blocks=38,
         num_heads=24,
@@ -188,7 +176,7 @@ configs = {
         qkv_bias=True,
         guidance_embed=True
     ),
-    "black-forest-labs/FLUX.1-schnell": FluxParams(
+    "schnell": FluxParams(
         depth=19,
         depth_single_blocks=38,
         num_heads=24,
