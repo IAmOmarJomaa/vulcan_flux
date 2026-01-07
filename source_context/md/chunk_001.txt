@@ -1,0 +1,1277 @@
+docs\config_README-en.md:
+First version: A.I Translation by Model: NousResearch/Nous-Hermes-2-Mixtral-8x7B-DPO, editing by Darkstorm2150
+
+Document is updated and maintained manually.
+
+# Config Readme
+
+This README is about the configuration files that can be passed with the `--dataset_config` option.
+
+## Overview
+
+By passing a configuration file, users can make detailed settings.
+
+* Multiple datasets can be configured
+   * For example, by setting `resolution` for each dataset, they can be mixed and trained.
+   * In training methods that support both the DreamBooth approach and the fine-tuning approach, datasets of the DreamBooth method and the fine-tuning method can be mixed.
+* Settings can be changed for each subset
+   * A subset is a partition of the dataset by image directory or metadata. Several subsets make up a dataset.
+   * Options such as `keep_tokens` and `flip_aug` can be set for each subset. On the other hand, options such as `resolution` and `batch_size` can be set for each dataset, and their values are common among subsets belonging to the same dataset. More details will be provided later.
+
+The configuration file format can be JSON or TOML. Considering the ease of writing, it is recommended to use [TOML](https://toml.io/ja/v1.0.0-rc.2). The following explanation assumes the use of TOML.
+
+
+Here is an example of a configuration file written in TOML.
+
+```toml
+[general]
+shuffle_caption = true
+caption_extension = '.txt'
+keep_tokens = 1
+
+# This is a DreamBooth-style dataset
+[[datasets]]
+resolution = 512
+batch_size = 4
+keep_tokens = 2
+
+  [[datasets.subsets]]
+  image_dir = 'C:\hoge'
+  class_tokens = 'hoge girl'
+  # This subset uses keep_tokens = 2 (the value of the parent datasets)
+
+  [[datasets.subsets]]
+  image_dir = 'C:\fuga'
+  class_tokens = 'fuga boy'
+  keep_tokens = 3
+
+  [[datasets.subsets]]
+  is_reg = true
+  image_dir = 'C:\reg'
+  class_tokens = 'human'
+  keep_tokens = 1
+
+# This is a fine-tuning dataset
+[[datasets]]
+resolution = [768, 768]
+batch_size = 2
+
+  [[datasets.subsets]]
+  image_dir = 'C:\piyo'
+  metadata_file = 'C:\piyo\piyo_md.json'
+  # This subset uses keep_tokens = 1 (the value of [general])
+```
+
+In this example, three directories are trained as a DreamBooth-style dataset at 512x512 (batch size 4), and one directory is trained as a fine-tuning dataset at 768x768 (batch size 2).
+
+## Settings for datasets and subsets
+
+Settings for datasets and subsets are divided into several registration locations.
+
+* `[general]`
+    * This is where options that apply to all datasets or all subsets are specified.
+    * If there are options with the same name in the dataset-specific or subset-specific settings, the dataset-specific or subset-specific settings take precedence.
+* `[[datasets]]`
+    * `datasets` is where settings for datasets are registered. This is where options that apply individually to each dataset are specified.
+	* If there are subset-specific settings, the subset-specific settings take precedence.
+* `[[datasets.subsets]]`
+    * `datasets.subsets` is where settings for subsets are registered. This is where options that apply individually to each subset are specified.
+
+Here is an image showing the correspondence between image directories and registration locations in the previous example.
+
+```
+C:\
+├─ hoge  ->  [[datasets.subsets]] No.1  ┐                        ┐
+├─ fuga  ->  [[datasets.subsets]] No.2  |->  [[datasets]] No.1   |->  [general]
+├─ reg   ->  [[datasets.subsets]] No.3  ┘                        |
+└─ piyo  ->  [[datasets.subsets]] No.4  -->  [[datasets]] No.2   ┘
+```
+
+The image directory corresponds to each `[[datasets.subsets]]`. Then, multiple `[[datasets.subsets]]` are combined to form one `[[datasets]]`. All `[[datasets]]` and `[[datasets.subsets]]` belong to `[general]`.
+
+The available options for each registration location may differ, but if the same option is specified, the value in the lower registration location will take precedence. You can check how the `keep_tokens` option is handled in the previous example for better understanding.
+
+Additionally, the available options may vary depending on the method that the learning approach supports.
+
+* Options specific to the DreamBooth method
+* Options specific to the fine-tuning method
+* Options available when using the caption dropout technique
+
+When using both the DreamBooth method and the fine-tuning method, they can be used together with a learning approach that supports both.
+When using them together, a point to note is that the method is determined based on the dataset, so it is not possible to mix DreamBooth method subsets and fine-tuning method subsets within the same dataset.
+In other words, if you want to use both methods together, you need to set up subsets of different methods belonging to different datasets.
+
+In terms of program behavior, if the `metadata_file` option exists, it is determined to be a subset of fine-tuning. Therefore, for subsets belonging to the same dataset, as long as they are either "all have the `metadata_file` option" or "all have no `metadata_file` option," there is no problem.
+
+Below, the available options will be explained. For options with the same name as the command-line argument, the explanation will be omitted in principle. Please refer to other READMEs.
+
+### Common options for all learning methods
+
+These are options that can be specified regardless of the learning method.
+
+#### Data set specific options
+
+These are options related to the configuration of the data set. They cannot be described in `datasets.subsets`.
+
+
+| Option Name | Example Setting | `[general]` | `[[datasets]]` |
+| ---- | ---- | ---- | ---- |
+| `batch_size` | `1` | o | o |
+| `bucket_no_upscale` | `true` | o | o |
+| `bucket_reso_steps` | `64` | o | o |
+| `enable_bucket` | `true` | o | o |
+| `max_bucket_reso` | `1024` | o | o |
+| `min_bucket_reso` | `128` | o | o |
+| `resolution` | `256`, `[512, 512]` | o | o |
+
+* `batch_size`
+    * This corresponds to the command-line argument `--train_batch_size`.
+* `max_bucket_reso`, `min_bucket_reso`
+    * Specify the maximum and minimum resolutions of the bucket. It must be divisible by `bucket_reso_steps`.
+
+These settings are fixed per dataset. That means that subsets belonging to the same dataset will share these settings. For example, if you want to prepare datasets with different resolutions, you can define them as separate datasets as shown in the example above, and set different resolutions for each.
+
+#### Options for Subsets
+
+These options are related to subset configuration.
+
+| Option Name | Example | `[general]` | `[[datasets]]` | `[[dataset.subsets]]` |
+| ---- | ---- | ---- | ---- | ---- |
+| `color_aug` | `false` | o | o | o |
+| `face_crop_aug_range` | `[1.0, 3.0]` | o | o | o |
+| `flip_aug` | `true` | o | o | o |
+| `keep_tokens` | `2` | o | o | o |
+| `num_repeats` | `10` | o | o | o |
+| `random_crop` | `false` | o | o | o |
+| `shuffle_caption` | `true` | o | o | o |
+| `caption_prefix` | `"masterpiece, best quality, "` | o | o | o |
+| `caption_suffix` | `", from side"` | o | o | o |
+| `caption_separator` |  (not specified) | o | o | o |
+| `keep_tokens_separator` | `“|||”` | o | o | o |
+| `secondary_separator` | `“;;;”` | o | o | o |
+| `enable_wildcard` | `true` | o | o | o |
+| `resize_interpolation` | (not specified) | o | o | o |
+
+* `num_repeats`
+    * Specifies the number of repeats for images in a subset. This is equivalent to `--dataset_repeats` in fine-tuning but can be specified for any training method.
+* `caption_prefix`, `caption_suffix`
+    * Specifies the prefix and suffix strings to be appended to the captions. Shuffling is performed with these strings included. Be cautious when using `keep_tokens`.
+* `caption_separator`
+    * Specifies the string to separate the tags. The default is `,`. This option is usually not necessary to set.
+* `keep_tokens_separator`
+    * Specifies the string to separate the parts to be fixed in the caption. For example, if you specify `aaa, bbb ||| ccc, ddd, eee, fff ||| ggg, hhh`, the parts `aaa, bbb` and `ggg, hhh` will remain, and the rest will be shuffled and dropped. The comma in between is not necessary. As a result, the prompt will be `aaa, bbb, eee, ccc, fff, ggg, hhh` or `aaa, bbb, fff, ccc, eee, ggg, hhh`, etc.
+* `secondary_separator`
+    * Specifies an additional separator. The part separated by this separator is treated as one tag and is shuffled and dropped. It is then replaced by `caption_separator`. For example, if you specify `aaa;;;bbb;;;ccc`, it will be replaced by `aaa,bbb,ccc` or dropped together.
+* `enable_wildcard`
+    * Enables wildcard notation. This will be explained later.
+* `resize_interpolation`
+    * Specifies the interpolation method used when resizing images. Normally, there is no need to specify this. The following options can be specified: `lanczos`, `nearest`, `bilinear`, `linear`, `bicubic`, `cubic`, `area`, `box`. By default (when not specified), `area` is used for downscaling, and `lanczos` is used for upscaling. If this option is specified, the same interpolation method will be used for both upscaling and downscaling. When `lanczos` or `box` is specified, PIL is used; for other options, OpenCV is used.
+
+### DreamBooth-specific options
+
+DreamBooth-specific options only exist as subsets-specific options.
+
+#### Subset-specific options
+
+Options related to the configuration of DreamBooth subsets.
+
+| Option Name | Example Setting | `[general]` | `[[datasets]]` | `[[dataset.subsets]]` |
+| ---- | ---- | ---- | ---- | ---- |
+| `image_dir` | `'C:\hoge'` | - | - | o (required) |
+| `caption_extension` | `".txt"` | o | o | o |
+| `class_tokens` | `"sks girl"` | - | - | o |
+| `cache_info` | `false` | o | o | o |
+| `is_reg` | `false` | - | - | o |
+
+Firstly, note that for `image_dir`, the path to the image files must be specified as being directly in the directory. Unlike the previous DreamBooth method, where images had to be placed in subdirectories, this is not compatible with that specification. Also, even if you name the folder something like "5_cat", the number of repeats of the image and the class name will not be reflected. If you want to set these individually, you will need to explicitly specify them using `num_repeats` and `class_tokens`.
+
+* `image_dir`
+    * Specifies the path to the image directory. This is a required option.
+    * Images must be placed directly under the directory.
+* `class_tokens`
+    * Sets the class tokens.
+    * Only used during training when a corresponding caption file does not exist. The determination of whether or not to use it is made on a per-image basis. If `class_tokens` is not specified and a caption file is not found, an error will occur.
+* `cache_info`
+    * Specifies whether to cache the image size and caption. If not specified, it is set to `false`. The cache is saved in `metadata_cache.json` in `image_dir`.
+    * Caching speeds up the loading of the dataset after the first time. It is effective when dealing with thousands of images or more.
+* `is_reg`
+    * Specifies whether the subset images are for normalization. If not specified, it is set to `false`, meaning that the images are not for normalization.
+
+### Fine-tuning method specific options
+
+The options for the fine-tuning method only exist for subset-specific options.
+
+#### Subset-specific options
+
+These options are related to the configuration of the fine-tuning method's subsets.
+
+| Option name | Example setting | `[general]` | `[[datasets]]` | `[[dataset.subsets]]` |
+| ---- | ---- | ---- | ---- | ---- |
+| `image_dir` | `'C:\hoge'` | - | - | o |
+| `metadata_file` | `'C:\piyo\piyo_md.json'` | - | - | o (required) |
+
+* `image_dir`
+    * Specify the path to the image directory. Unlike the DreamBooth method, specifying it is not mandatory, but it is recommended to do so.
+        * The case where it is not necessary to specify is when the `--full_path` is added to the command line when generating the metadata file.
+    * The images must be placed directly under the directory.
+* `metadata_file`
+    * Specify the path to the metadata file used for the subset. This is a required option.
+        * It is equivalent to the command-line argument `--in_json`.
+    * Due to the specification that a metadata file must be specified for each subset, it is recommended to avoid creating a metadata file with images from different directories as a single metadata file. It is strongly recommended to prepare a separate metadata file for each image directory and register them as separate subsets.
+
+### Options available when caption dropout method can be used
+
+The options available when the caption dropout method can be used exist only for subsets. Regardless of whether it's the DreamBooth method or fine-tuning method, if it supports caption dropout, it can be specified.
+
+#### Subset-specific options
+
+Options related to the setting of subsets that caption dropout can be used for.
+
+| Option Name | `[general]` | `[[datasets]]` | `[[dataset.subsets]]` |
+| ---- | ---- | ---- | ---- |
+| `caption_dropout_every_n_epochs` | o | o | o |
+| `caption_dropout_rate` | o | o | o |
+| `caption_tag_dropout_rate` | o | o | o |
+
+## Behavior when there are duplicate subsets
+
+In the case of the DreamBooth dataset, if there are multiple `image_dir` directories with the same content, they are considered to be duplicate subsets. For the fine-tuning dataset, if there are multiple `metadata_file` files with the same content, they are considered to be duplicate subsets. If duplicate subsets exist in the dataset, subsequent subsets will be ignored.
+
+However, if they belong to different datasets, they are not considered duplicates. For example, if you have subsets with the same `image_dir` in different datasets, they will not be considered duplicates. This is useful when you want to train with the same image but with different resolutions.
+
+```toml
+# If data sets exist separately, they are not considered duplicates and are both used for training.
+
+[[datasets]]
+resolution = 512
+
+  [[datasets.subsets]]
+  image_dir = 'C:\hoge'
+
+[[datasets]]
+resolution = 768
+
+  [[datasets.subsets]]
+  image_dir = 'C:\hoge'
+```
+
+## Command Line Argument and Configuration File
+
+There are options in the configuration file that have overlapping roles with command line argument options.
+
+The following command line argument options are ignored if a configuration file is passed:
+
+* `--train_data_dir`
+* `--reg_data_dir`
+* `--in_json`
+
+For the command line options listed below, if an option is specified in both the command line arguments and the configuration file, the value from the configuration file will be given priority. Unless otherwise noted, the option names are the same.
+
+| Command Line Argument Option   | Corresponding Configuration File Option |
+| ------------------------------- | --------------------------------------- |
+| `--bucket_no_upscale`           |                                       |
+| `--bucket_reso_steps`           |                                       |
+| `--caption_dropout_every_n_epochs` |                                       |
+| `--caption_dropout_rate`        |                                       |
+| `--caption_extension`           |                                       |
+| `--caption_tag_dropout_rate`    |                                       |
+| `--color_aug`                   |                                       |
+| `--dataset_repeats`             | `num_repeats`                          |
+| `--enable_bucket`               |                                       |
+| `--face_crop_aug_range`         |                                       |
+| `--flip_aug`                    |                                       |
+| `--keep_tokens`                 |                                       |
+| `--min_bucket_reso`              |                                       |
+| `--random_crop`                 |                                       |
+| `--resolution`                  |                                       |
+| `--shuffle_caption`             |                                       |
+| `--train_batch_size`            | `batch_size`                           |
+
+## Error Guide
+
+Currently, we are using an external library to check if the configuration file is written correctly, but the development has not been completed, and there is a problem that the error message is not clear. In the future, we plan to improve this problem.
+
+As a temporary measure, we will list common errors and their solutions. If you encounter an error even though it should be correct or if the error content is not understandable, please contact us as it may be a bug.
+
+* `voluptuous.error.MultipleInvalid: required key not provided @ ...`: This error occurs when a required option is not provided. It is highly likely that you forgot to specify the option or misspelled the option name.
+  * The error location is indicated by `...` in the error message. For example, if you encounter an error like `voluptuous.error.MultipleInvalid: required key not provided @ data['datasets'][0]['subsets'][0]['image_dir']`, it means that the `image_dir` option does not exist in the 0th `subsets` of the 0th `datasets` setting.
+* `voluptuous.error.MultipleInvalid: expected int for dictionary value @ ...`: This error occurs when the specified value format is incorrect. It is highly likely that the value format is incorrect. The `int` part changes depending on the target option. The example configurations in this README may be helpful.
+* `voluptuous.error.MultipleInvalid: extra keys not allowed @ ...`: This error occurs when there is an option name that is not supported. It is highly likely that you misspelled the option name or mistakenly included it.
+
+## Miscellaneous
+
+### Multi-line captions
+
+By setting `enable_wildcard = true`, multiple-line captions are also enabled. If the caption file consists of multiple lines, one line is randomly selected as the caption. 
+
+```txt
+1girl, hatsune miku, vocaloid, upper body, looking at viewer, microphone, stage
+a girl with a microphone standing on a stage
+detailed digital art of a girl with a microphone on a stage
+```
+
+It can be combined with wildcard notation.
+
+In metadata files, you can also specify multiple-line captions. In the `.json` metadata file, use `\n` to represent a line break. If the caption file consists of multiple lines, `merge_captions_to_metadata.py` will create a metadata file in this format.
+
+The tags in the metadata (`tags`) are added to each line of the caption.
+
+```json
+{
+    "/path/to/image.png": {
+        "caption": "a cartoon of a frog with the word frog on it\ntest multiline caption1\ntest multiline caption2",
+        "tags": "open mouth, simple background, standing, no humans, animal, black background, frog, animal costume, animal focus"
+    },
+    ...
+}
+```
+
+In this case, the actual caption will be `a cartoon of a frog with the word frog on it, open mouth, simple background ...`, `test multiline caption1, open mouth, simple background ...`, `test multiline caption2, open mouth, simple background ...`, etc.
+
+### Example of configuration file : `secondary_separator`, wildcard notation, `keep_tokens_separator`, etc.
+
+```toml
+[general]
+flip_aug = true
+color_aug = false
+resolution = [1024, 1024]
+
+[[datasets]]
+batch_size = 6
+enable_bucket = true
+bucket_no_upscale = true
+caption_extension = ".txt"
+keep_tokens_separator= "|||"
+shuffle_caption = true
+caption_tag_dropout_rate = 0.1
+secondary_separator = ";;;" # subset 側に書くこともできます / can be written in the subset side
+enable_wildcard = true # 同上 / same as above
+
+  [[datasets.subsets]]
+  image_dir = "/path/to/image_dir"
+  num_repeats = 1
+
+  # ||| の前後はカンマは不要です（自動的に追加されます） / No comma is required before and after ||| (it is added automatically)
+  caption_prefix = "1girl, hatsune miku, vocaloid |||" 
+  
+  # ||| の後はシャッフル、drop されず残ります / After |||, it is not shuffled or dropped and remains
+  # 単純に文字列として連結されるので、カンマなどは自分で入れる必要があります / It is simply concatenated as a string, so you need to put commas yourself
+  caption_suffix = ", anime screencap ||| masterpiece, rating: general"
+```
+
+### Example of caption, secondary_separator notation: `secondary_separator = ";;;"`
+
+```txt
+1girl, hatsune miku, vocaloid, upper body, looking at viewer, sky;;;cloud;;;day, outdoors
+```
+The part `sky;;;cloud;;;day` is replaced with `sky,cloud,day` without shuffling or dropping. When shuffling and dropping are enabled, it is processed as a whole (as one tag). For example, it becomes `vocaloid, 1girl, upper body, sky,cloud,day, outdoors, hatsune miku` (shuffled) or `vocaloid, 1girl, outdoors, looking at viewer, upper body, hatsune miku` (dropped).
+
+### Example of caption, enable_wildcard notation: `enable_wildcard = true`
+
+```txt
+1girl, hatsune miku, vocaloid, upper body, looking at viewer, {simple|white} background
+```
+`simple` or `white` is randomly selected, and it becomes `simple background` or `white background`.
+
+```txt
+1girl, hatsune miku, vocaloid, {{retro style}}
+```
+If you want to include `{` or `}` in the tag string, double them like `{{` or `}}` (in this example, the actual caption used for training is `{retro style}`).
+
+### Example of caption, `keep_tokens_separator` notation: `keep_tokens_separator = "|||"`
+
+```txt
+1girl, hatsune miku, vocaloid ||| stage, microphone, white shirt, smile ||| best quality, rating: general
+```
+It becomes `1girl, hatsune miku, vocaloid, microphone, stage, white shirt, best quality, rating: general` or `1girl, hatsune miku, vocaloid, white shirt, smile, stage, microphone, best quality, rating: general` etc.
+
+
+
+docs\config_README-ja.md:
+`--dataset_config` で渡すことができる設定ファイルに関する説明です。
+
+## 概要
+
+設定ファイルを渡すことにより、ユーザが細かい設定を行えるようにします。
+
+* 複数のデータセットが設定可能になります
+    * 例えば `resolution` をデータセットごとに設定して、それらを混合して学習できます。
+    * DreamBooth の手法と fine tuning の手法の両方に対応している学習方法では、DreamBooth 方式と fine tuning 方式のデータセットを混合することが可能です。
+* サブセットごとに設定を変更することが可能になります
+    * データセットを画像ディレクトリ別またはメタデータ別に分割したものがサブセットです。いくつかのサブセットが集まってデータセットを構成します。
+    * `keep_tokens` や `flip_aug` 等のオプションはサブセットごとに設定可能です。一方、`resolution` や `batch_size` といったオプションはデータセットごとに設定可能で、同じデータセットに属するサブセットでは値が共通になります。詳しくは後述します。
+
+設定ファイルの形式は JSON か TOML を利用できます。記述のしやすさを考えると [TOML](https://toml.io/ja/v1.0.0-rc.2) を利用するのがオススメです。以下、TOML の利用を前提に説明します。
+
+TOML で記述した設定ファイルの例です。
+
+```toml
+[general]
+shuffle_caption = true
+caption_extension = '.txt'
+keep_tokens = 1
+
+# これは DreamBooth 方式のデータセット
+[[datasets]]
+resolution = 512
+batch_size = 4
+keep_tokens = 2
+
+  [[datasets.subsets]]
+  image_dir = 'C:\hoge'
+  class_tokens = 'hoge girl'
+  # このサブセットは keep_tokens = 2 （所属する datasets の値が使われる）
+
+  [[datasets.subsets]]
+  image_dir = 'C:\fuga'
+  class_tokens = 'fuga boy'
+  keep_tokens = 3
+
+  [[datasets.subsets]]
+  is_reg = true
+  image_dir = 'C:\reg'
+  class_tokens = 'human'
+  keep_tokens = 1
+
+# これは fine tuning 方式のデータセット
+[[datasets]]
+resolution = [768, 768]
+batch_size = 2
+
+  [[datasets.subsets]]
+  image_dir = 'C:\piyo'
+  metadata_file = 'C:\piyo\piyo_md.json'
+  # このサブセットは keep_tokens = 1 （general の値が使われる）
+```
+
+この例では、3 つのディレクトリを DreamBooth 方式のデータセットとして 512x512 (batch size 4) で学習させ、1 つのディレクトリを fine tuning 方式のデータセットとして 768x768 (batch size 2) で学習させることになります。
+
+## データセット・サブセットに関する設定
+
+データセット・サブセットに関する設定は、登録可能な箇所がいくつかに分かれています。
+
+* `[general]`
+    * 全データセットまたは全サブセットに適用されるオプションを指定する箇所です。
+    * データセットごとの設定及びサブセットごとの設定に同名のオプションが存在していた場合には、データセット・サブセットごとの設定が優先されます。
+* `[[datasets]]`
+    * `datasets` はデータセットに関する設定の登録箇所になります。各データセットに個別に適用されるオプションを指定する箇所です。
+    * サブセットごとの設定が存在していた場合には、サブセットごとの設定が優先されます。
+* `[[datasets.subsets]]`
+    * `datasets.subsets` はサブセットに関する設定の登録箇所になります。各サブセットに個別に適用されるオプションを指定する箇所です。
+
+先程の例における、画像ディレクトリと登録箇所の対応に関するイメージ図です。
+
+```
+C:\
+├─ hoge  ->  [[datasets.subsets]] No.1  ┐                        ┐
+├─ fuga  ->  [[datasets.subsets]] No.2  |->  [[datasets]] No.1   |->  [general]
+├─ reg   ->  [[datasets.subsets]] No.3  ┘                        |
+└─ piyo  ->  [[datasets.subsets]] No.4  -->  [[datasets]] No.2   ┘
+```
+
+画像ディレクトリがそれぞれ1つの `[[datasets.subsets]]` に対応しています。そして `[[datasets.subsets]]` が1つ以上組み合わさって1つの `[[datasets]]` を構成します。`[general]` には全ての `[[datasets]]`, `[[datasets.subsets]]` が属します。
+
+登録箇所ごとに指定可能なオプションは異なりますが、同名のオプションが指定された場合は下位の登録箇所にある値が優先されます。先程の例の `keep_tokens` オプションの扱われ方を確認してもらうと理解しやすいかと思います。
+
+加えて、学習方法が対応している手法によっても指定可能なオプションが変化します。
+
+* DreamBooth 方式専用のオプション
+* fine tuning 方式専用のオプション
+* caption dropout の手法が使える場合のオプション
+
+DreamBooth の手法と fine tuning の手法の両方とも利用可能な学習方法では、両者を併用することができます。
+併用する際の注意点として、DreamBooth 方式なのか fine tuning 方式なのかはデータセット単位で判別を行っているため、同じデータセット中に DreamBooth 方式のサブセットと fine tuning 方式のサブセットを混在させることはできません。
+つまり、これらを併用したい場合には異なる方式のサブセットが異なるデータセットに所属するように設定する必要があります。
+
+プログラムの挙動としては、後述する `metadata_file` オプションが存在していたら fine tuning 方式のサブセットだと判断します。
+そのため、同一のデータセットに所属するサブセットについて言うと、「全てが `metadata_file` オプションを持つ」か「全てが `metadata_file` オプションを持たない」かのどちらかになっていれば問題ありません。
+
+以下、利用可能なオプションを説明します。コマンドライン引数と名称が同一のオプションについては、基本的に説明を割愛します。他の README を参照してください。
+
+### 全学習方法で共通のオプション
+
+学習方法によらずに指定可能なオプションです。
+
+#### データセット向けオプション
+
+データセットの設定に関わるオプションです。`datasets.subsets` には記述できません。
+
+| オプション名 | 設定例 | `[general]` | `[[datasets]]` |
+| ---- | ---- | ---- | ---- |
+| `batch_size` | `1` | o | o |
+| `bucket_no_upscale` | `true` | o | o |
+| `bucket_reso_steps` | `64` | o | o |
+| `enable_bucket` | `true` | o | o |
+| `max_bucket_reso` | `1024` | o | o |
+| `min_bucket_reso` | `128` | o | o |
+| `resolution` | `256`, `[512, 512]` | o | o |
+
+* `batch_size`
+    * コマンドライン引数の `--train_batch_size` と同等です。
+* `max_bucket_reso`, `min_bucket_reso`
+    * bucketの最大、最小解像度を指定します。`bucket_reso_steps` で割り切れる必要があります。
+
+これらの設定はデータセットごとに固定です。
+つまり、データセットに所属するサブセットはこれらの設定を共有することになります。
+例えば解像度が異なるデータセットを用意したい場合は、上に挙げた例のように別々のデータセットとして定義すれば別々の解像度を設定可能です。
+
+#### サブセット向けオプション
+
+サブセットの設定に関わるオプションです。
+
+| オプション名 | 設定例 | `[general]` | `[[datasets]]` | `[[dataset.subsets]]` |
+| ---- | ---- | ---- | ---- | ---- |
+| `color_aug` | `false` | o | o | o |
+| `face_crop_aug_range` | `[1.0, 3.0]` | o | o | o |
+| `flip_aug` | `true` | o | o | o |
+| `keep_tokens` | `2` | o | o | o |
+| `num_repeats` | `10` | o | o | o |
+| `random_crop` | `false` | o | o | o |
+| `shuffle_caption` | `true` | o | o | o |
+| `caption_prefix` | `“masterpiece, best quality, ”` | o | o | o |
+| `caption_suffix` | `“, from side”` | o | o | o |
+| `caption_separator` | （通常は設定しません） | o | o | o |
+| `keep_tokens_separator` | `“|||”` | o | o | o |
+| `secondary_separator` | `“;;;”` | o | o | o |
+| `enable_wildcard` | `true` | o | o | o |
+| `resize_interpolation` |（通常は設定しません） | o | o | o |
+
+* `num_repeats`
+    * サブセットの画像の繰り返し回数を指定します。fine tuning における `--dataset_repeats` に相当しますが、`num_repeats` はどの学習方法でも指定可能です。
+* `caption_prefix`, `caption_suffix`
+    * キャプションの前、後に付与する文字列を指定します。シャッフルはこれらの文字列を含めた状態で行われます。`keep_tokens` を指定する場合には注意してください。
+
+* `caption_separator`
+    * タグを区切る文字列を指定します。デフォルトは `,` です。このオプションは通常は設定する必要はありません。
+
+* `keep_tokens_separator`
+    *  キャプションで固定したい部分を区切る文字列を指定します。たとえば `aaa, bbb ||| ccc, ddd, eee, fff ||| ggg, hhh` のように指定すると、`aaa, bbb` と `ggg, hhh` の部分はシャッフル、drop されず残ります。間のカンマは不要です。結果としてプロンプトは `aaa, bbb, eee, ccc, fff, ggg, hhh` や `aaa, bbb, fff, ccc, eee, ggg, hhh` などになります。
+
+* `secondary_separator`
+    * 追加の区切り文字を指定します。この区切り文字で区切られた部分は一つのタグとして扱われ、シャッフル、drop されます。その後、`caption_separator` に置き換えられます。たとえば `aaa;;;bbb;;;ccc` のように指定すると、`aaa,bbb,ccc` に置き換えられるか、まとめて drop されます。
+
+* `enable_wildcard`
+    * ワイルドカード記法および複数行キャプションを有効にします。ワイルドカード記法、複数行キャプションについては後述します。
+
+* `resize_interpolation`
+    * 画像のリサイズ時に使用する補間方法を指定します。通常は指定しなくて構いません。`lanczos`, `nearest`, `bilinear`, `linear`, `bicubic`, `cubic`, `area`, `box` が指定可能です。デフォルト（未指定時）は、縮小時は `area`、拡大時は `lanczos` になります。このオプションを指定すると、拡大時・縮小時とも同じ補間方法が使用されます。`lanczos`、`box`を指定するとPILが、それ以外を指定するとOpenCVが使用されます。
+
+### DreamBooth 方式専用のオプション
+
+DreamBooth 方式のオプションは、サブセット向けオプションのみ存在します。
+
+#### サブセット向けオプション
+
+DreamBooth 方式のサブセットの設定に関わるオプションです。
+
+| オプション名 | 設定例 | `[general]` | `[[datasets]]` | `[[dataset.subsets]]` |
+| ---- | ---- | ---- | ---- | ---- |
+| `image_dir` | `‘C:\hoge’` | - | - | o（必須） |
+| `caption_extension` | `".txt"` | o | o | o |
+| `class_tokens` | `“sks girl”` | - | - | o |
+| `cache_info` | `false` | o | o | o | 
+| `is_reg` | `false` | - | - | o |
+
+まず注意点として、 `image_dir` には画像ファイルが直下に置かれているパスを指定する必要があります。従来の DreamBooth の手法ではサブディレクトリに画像を置く必要がありましたが、そちらとは仕様に互換性がありません。また、`5_cat` のようなフォルダ名にしても、画像の繰り返し回数とクラス名は反映されません。これらを個別に設定したい場合、`num_repeats` と `class_tokens` で明示的に指定する必要があることに注意してください。
+
+* `image_dir`
+    * 画像ディレクトリのパスを指定します。指定必須オプションです。
+    * 画像はディレクトリ直下に置かれている必要があります。
+* `class_tokens`
+    * クラストークンを設定します。
+    * 画像に対応する caption ファイルが存在しない場合にのみ学習時に利用されます。利用するかどうかの判定は画像ごとに行います。`class_tokens` を指定しなかった場合に caption ファイルも見つからなかった場合にはエラーになります。
+* `cache_info`
+    * 画像サイズ、キャプションをキャッシュするかどうかを指定します。指定しなかった場合は `false` になります。キャッシュは `image_dir` に `metadata_cache.json` というファイル名で保存されます。
+    * キャッシュを行うと、二回目以降のデータセット読み込みが高速化されます。数千枚以上の画像を扱う場合には有効です。
+* `is_reg`
+    * サブセットの画像が正規化用かどうかを指定します。指定しなかった場合は `false` として、つまり正規化画像ではないとして扱います。
+
+### fine tuning 方式専用のオプション
+
+fine tuning 方式のオプションは、サブセット向けオプションのみ存在します。
+
+#### サブセット向けオプション
+
+fine tuning 方式のサブセットの設定に関わるオプションです。
+
+| オプション名 | 設定例 | `[general]` | `[[datasets]]` | `[[dataset.subsets]]` |
+| ---- | ---- | ---- | ---- | ---- |
+| `image_dir` | `‘C:\hoge’` | - | - | o |
+| `metadata_file` | `'C:\piyo\piyo_md.json'` | - | - | o（必須） |
+
+* `image_dir`
+    * 画像ディレクトリのパスを指定します。DreamBooth の手法の方とは異なり指定は必須ではありませんが、設定することを推奨します。
+        * 指定する必要がない状況としては、メタデータファイルの生成時に `--full_path` を付与して実行していた場合です。
+    * 画像はディレクトリ直下に置かれている必要があります。
+* `metadata_file`
+    * サブセットで利用されるメタデータファイルのパスを指定します。指定必須オプションです。
+        * コマンドライン引数の `--in_json` と同等です。
+    * サブセットごとにメタデータファイルを指定する必要がある仕様上、ディレクトリを跨いだメタデータを1つのメタデータファイルとして作成することは避けた方が良いでしょう。画像ディレクトリごとにメタデータファイルを用意し、それらを別々のサブセットとして登録することを強く推奨します。
+
+### caption dropout の手法が使える場合に指定可能なオプション
+
+caption dropout の手法が使える場合のオプションは、サブセット向けオプションのみ存在します。
+DreamBooth 方式か fine tuning 方式かに関わらず、caption dropout に対応している学習方法であれば指定可能です。
+
+#### サブセット向けオプション
+
+caption dropout が使えるサブセットの設定に関わるオプションです。
+
+| オプション名 | `[general]` | `[[datasets]]` | `[[dataset.subsets]]` |
+| ---- | ---- | ---- | ---- |
+| `caption_dropout_every_n_epochs` | o | o | o |
+| `caption_dropout_rate` | o | o | o |
+| `caption_tag_dropout_rate` | o | o | o |
+
+## 重複したサブセットが存在する時の挙動
+
+DreamBooth 方式のデータセットの場合、その中にある `image_dir` が同一のサブセットは重複していると見なされます。
+fine tuning 方式のデータセットの場合は、その中にある `metadata_file` が同一のサブセットは重複していると見なされます。
+データセット中に重複したサブセットが存在する場合、2個目以降は無視されます。
+
+一方、異なるデータセットに所属している場合は、重複しているとは見なされません。
+例えば、以下のように同一の `image_dir` を持つサブセットを別々のデータセットに入れた場合には、重複していないと見なします。
+これは、同じ画像でも異なる解像度で学習したい場合に役立ちます。
+
+```toml
+# 別々のデータセットに存在している場合は重複とは見なされず、両方とも学習に使われる
+
+[[datasets]]
+resolution = 512
+
+  [[datasets.subsets]]
+  image_dir = 'C:\hoge'
+
+[[datasets]]
+resolution = 768
+
+  [[datasets.subsets]]
+  image_dir = 'C:\hoge'
+```
+
+## コマンドライン引数との併用
+
+設定ファイルのオプションの中には、コマンドライン引数のオプションと役割が重複しているものがあります。
+
+以下に挙げるコマンドライン引数のオプションは、設定ファイルを渡した場合には無視されます。
+
+* `--train_data_dir`
+* `--reg_data_dir`
+* `--in_json`
+
+以下に挙げるコマンドライン引数のオプションは、コマンドライン引数と設定ファイルで同時に指定された場合、コマンドライン引数の値よりも設定ファイルの値が優先されます。特に断りがなければ同名のオプションとなります。
+
+| コマンドライン引数のオプション     | 優先される設定ファイルのオプション |
+| ---------------------------------- | ---------------------------------- |
+| `--bucket_no_upscale`              |                                    |
+| `--bucket_reso_steps`              |                                    |
+| `--caption_dropout_every_n_epochs` |                                    |
+| `--caption_dropout_rate`           |                                    |
+| `--caption_extension`              |                                    |
+| `--caption_tag_dropout_rate`       |                                    |
+| `--color_aug`                      |                                    |
+| `--dataset_repeats`                | `num_repeats`                      |
+| `--enable_bucket`                  |                                    |
+| `--face_crop_aug_range`            |                                    |
+| `--flip_aug`                       |                                    |
+| `--keep_tokens`                    |                                    |
+| `--min_bucket_reso`                |                                    |
+| `--random_crop`                    |                                    |
+| `--resolution`                     |                                    |
+| `--shuffle_caption`                |                                    |
+| `--train_batch_size`               | `batch_size`                       |
+
+## エラーの手引き
+
+現在、外部ライブラリを利用して設定ファイルの記述が正しいかどうかをチェックしているのですが、整備が行き届いておらずエラーメッセージがわかりづらいという問題があります。
+将来的にはこの問題の改善に取り組む予定です。
+
+次善策として、頻出のエラーとその対処法について載せておきます。
+正しいはずなのにエラーが出る場合、エラー内容がどうしても分からない場合は、バグかもしれないのでご連絡ください。
+
+* `voluptuous.error.MultipleInvalid: required key not provided @ ...`: 指定必須のオプションが指定されていないというエラーです。指定を忘れているか、オプション名を間違って記述している可能性が高いです。
+  * `...` の箇所にはエラーが発生した場所が載っています。例えば `voluptuous.error.MultipleInvalid: required key not provided @ data['datasets'][0]['subsets'][0]['image_dir']` のようなエラーが出たら、0 番目の `datasets` 中の 0 番目の `subsets` の設定に `image_dir` が存在しないということになります。
+* `voluptuous.error.MultipleInvalid: expected int for dictionary value @ ...`: 指定する値の形式が不正というエラーです。値の形式が間違っている可能性が高いです。`int` の部分は対象となるオプションによって変わります。この README に載っているオプションの「設定例」が役立つかもしれません。
+* `voluptuous.error.MultipleInvalid: extra keys not allowed @ ...`: 対応していないオプション名が存在している場合に発生するエラーです。オプション名を間違って記述しているか、誤って紛れ込んでいる可能性が高いです。
+
+## その他
+
+### 複数行キャプション
+
+`enable_wildcard = true` を設定することで、複数行キャプションも同時に有効になります。キャプションファイルが複数の行からなる場合、ランダムに一つの行が選ばれてキャプションとして利用されます。
+
+```txt
+1girl, hatsune miku, vocaloid, upper body, looking at viewer, microphone, stage
+a girl with a microphone standing on a stage
+detailed digital art of a girl with a microphone on a stage
+```
+
+ワイルドカード記法と組み合わせることも可能です。
+
+メタデータファイルでも同様に複数行キャプションを指定することができます。メタデータの .json 内には、`\n` を使って改行を表現してください。キャプションファイルが複数行からなる場合、`merge_captions_to_metadata.py` を使うと、この形式でメタデータファイルが作成されます。
+
+メタデータのタグ (`tags`) は、キャプションの各行に追加されます。
+
+```json
+{
+    "/path/to/image.png": {
+        "caption": "a cartoon of a frog with the word frog on it\ntest multiline caption1\ntest multiline caption2",
+        "tags": "open mouth, simple background, standing, no humans, animal, black background, frog, animal costume, animal focus"
+    },
+    ...
+}
+```
+
+この場合、実際のキャプションは `a cartoon of a frog with the word frog on it, open mouth, simple background ...` または `test multiline caption1, open mouth, simple background ...`、 `test multiline caption2, open mouth, simple background ...` 等になります。
+
+### 設定ファイルの記述例：追加の区切り文字、ワイルドカード記法、`keep_tokens_separator` 等
+
+```toml
+[general]
+flip_aug = true
+color_aug = false
+resolution = [1024, 1024]
+
+[[datasets]]
+batch_size = 6
+enable_bucket = true
+bucket_no_upscale = true
+caption_extension = ".txt"
+keep_tokens_separator= "|||"
+shuffle_caption = true
+caption_tag_dropout_rate = 0.1
+secondary_separator = ";;;" # subset 側に書くこともできます / can be written in the subset side
+enable_wildcard = true # 同上 / same as above
+
+  [[datasets.subsets]]
+  image_dir = "/path/to/image_dir"
+  num_repeats = 1
+
+  # ||| の前後はカンマは不要です（自動的に追加されます） / No comma is required before and after ||| (it is added automatically)
+  caption_prefix = "1girl, hatsune miku, vocaloid |||" 
+  
+  # ||| の後はシャッフル、drop されず残ります / After |||, it is not shuffled or dropped and remains
+  # 単純に文字列として連結されるので、カンマなどは自分で入れる必要があります / It is simply concatenated as a string, so you need to put commas yourself
+  caption_suffix = ", anime screencap ||| masterpiece, rating: general"
+```
+
+### キャプション記述例、secondary_separator 記法：`secondary_separator = ";;;"` の場合
+
+```txt
+1girl, hatsune miku, vocaloid, upper body, looking at viewer, sky;;;cloud;;;day, outdoors
+```
+`sky;;;cloud;;;day` の部分はシャッフル、drop されず `sky,cloud,day` に置換されます。シャッフル、drop が有効な場合、まとめて（一つのタグとして）処理されます。つまり `vocaloid, 1girl, upper body, sky,cloud,day, outdoors, hatsune miku` （シャッフル）や `vocaloid, 1girl, outdoors, looking at viewer, upper body, hatsune miku` （drop されたケース）などになります。
+
+### キャプション記述例、ワイルドカード記法： `enable_wildcard = true` の場合
+
+```txt
+1girl, hatsune miku, vocaloid, upper body, looking at viewer, {simple|white} background
+```
+ランダムに `simple` または `white` が選ばれ、`simple background` または `white background` になります。
+
+```txt
+1girl, hatsune miku, vocaloid, {{retro style}}
+```
+タグ文字列に `{` や `}` そのものを含めたい場合は `{{` や `}}` のように二つ重ねてください（この例では実際に学習に用いられるキャプションは `{retro style}` になります）。
+
+### キャプション記述例、`keep_tokens_separator` 記法： `keep_tokens_separator = "|||"` の場合
+
+```txt
+1girl, hatsune miku, vocaloid ||| stage, microphone, white shirt, smile ||| best quality, rating: general
+```
+`1girl, hatsune miku, vocaloid, microphone, stage, white shirt, best quality, rating: general` や `1girl, hatsune miku, vocaloid, white shirt, smile, stage, microphone, best quality, rating: general` などになります。
+
+
+docs\fine_tune.md:
+# Fine-tuning Guide
+
+This document explains how to perform fine-tuning on various model architectures using the `*_train.py` scripts.
+
+<details>
+<summary>日本語</summary>
+
+# Fine-tuning ガイド
+
+このドキュメントでは、`*_train.py` スクリプトを用いた、各種モデルアーキテクチャのFine-tuningの方法について解説します。
+
+</details>
+
+### Difference between Fine-tuning and LoRA tuning
+
+This repository supports two methods for additional model training: **Fine-tuning** and **LoRA (Low-Rank Adaptation)**. Each method has distinct features and advantages.
+
+**Fine-tuning** is a method that retrains all (or most) of the weights of a pre-trained model.
+- **Pros**: It can improve the overall expressive power of the model and is suitable for learning styles or concepts that differ significantly from the original model.
+- **Cons**:
+    - It requires a large amount of VRAM and computational cost.
+    - The saved file size is large (same as the original model).
+    - It is prone to "overfitting," where the model loses the diversity of the original model if over-trained.
+- **Corresponding scripts**: Scripts named `*_train.py`, such as `sdxl_train.py`, `sd3_train.py`, `flux_train.py`, and `lumina_train.py`.
+
+**LoRA tuning** is a method that freezes the model's weights and only trains a small additional network called an "adapter."
+- **Pros**:
+    - It allows for fast training with low VRAM and computational cost.
+    - It is considered resistant to overfitting because it trains fewer weights.
+    - The saved file (LoRA network) is very small, ranging from tens to hundreds of MB, making it easy to manage.
+    - Multiple LoRAs can be used in combination.
+- **Cons**: Since it does not train the entire model, it may not achieve changes as significant as fine-tuning.
+- **Corresponding scripts**: Scripts named `*_train_network.py`, such as `sdxl_train_network.py`, `sd3_train_network.py`, and `flux_train_network.py`.
+
+| Feature | Fine-tuning | LoRA tuning |
+|:---|:---|:---|
+| **Training Target** | All model weights | Additional network (adapter) only |
+| **VRAM/Compute Cost**| High | Low |
+| **Training Time** | Long | Short |
+| **File Size** | Large (several GB) | Small (few MB to hundreds of MB) |
+| **Overfitting Risk** | High | Low |
+| **Suitable Use Case** | Major style changes, concept learning | Adding specific characters or styles |
+
+Generally, it is recommended to start with **LoRA tuning** if you want to add a specific character or style. **Fine-tuning** is a valid option for more fundamental style changes or aiming for a high-quality model.
+
+<details>
+<summary>日本語</summary>
+
+### Fine-tuningとLoRA学習の違い
+
+このリポジトリでは、モデルの追加学習手法として**Fine-tuning**と**LoRA (Low-Rank Adaptation)**学習の2種類をサポートしています。それぞれの手法には異なる特徴と利点があります。
+
+**Fine-tuning**は、事前学習済みモデルの重み全体（または大部分）を再学習する手法です。
+- **利点**: モデル全体の表現力を向上させることができ、元のモデルから大きく変化した画風やコンセプトの学習に適しています。
+- **欠点**:
+    - 学習には多くのVRAMと計算コストが必要です。
+    - 保存されるファイルサイズが大きくなります（元のモデルと同じサイズ）。
+    - 学習させすぎると、元のモデルが持っていた多様性が失われる「過学習（overfitting）」に陥りやすい傾向があります。
+- **対応スクリプト**: `sdxl_train.py`, `sd3_train.py`, `flux_train.py`, `lumina_train.py` など、`*_train.py` という命名規則のスクリプトが対応します。
+
+**LoRA学習**は、モデルの重みは凍結（固定）したまま、「アダプター」と呼ばれる小さな追加ネットワークのみを学習する手法です。
+- **利点**:
+    - 少ないVRAMと計算コストで高速に学習できます。
+    - 学習する重みが少ないため、過学習に強いとされています。
+    - 保存されるファイル（LoRAネットワーク）は数十〜数百MBと非常に小さく、管理が容易です。
+    - 複数のLoRAを組み合わせて使用することも可能です。
+- **欠点**: モデル全体を学習するわけではないため、Fine-tuningほどの大きな変化は期待できない場合があります。
+- **対応スクリプト**: `sdxl_train_network.py`, `sd3_train_network.py`, `flux_train_network.py` など、`*_train_network.py` という命名規則のスクリプトが対応します。
+
+| 特徴 | Fine-tuning | LoRA学習 |
+|:---|:---|:---|
+| **学習対象** | モデルの全重み | 追加ネットワーク（アダプター）のみ |
+| **VRAM/計算コスト**| 大 | 小 |
+| **学習時間** | 長 | 短 |
+| **ファイルサイズ** | 大（数GB） | 小（数MB〜数百MB） |
+| **過学習リスク** | 高 | 低 |
+| **適した用途** | 大規模な画風変更、コンセプト学習 | 特定のキャラ、画風の追加学習 |
+
+一般的に、特定のキャラクターや画風を追加したい場合は**LoRA学習**から試すことが推奨されます。より根本的な画風の変更や、高品質なモデルを目指す場合は**Fine-tuning**が有効な選択肢となります。
+
+</details>
+
+--- 
+
+### Fine-tuning for each architecture
+
+Fine-tuning updates the entire weights of the model, so it has different options and considerations than LoRA tuning. This section describes the fine-tuning scripts for major architectures.
+
+The basic command structure is common to all architectures.
+
+```bash
+accelerate launch --mixed_precision bf16 {script_name}.py \
+  --pretrained_model_name_or_path <path_to_model> \
+  --dataset_config <path_to_config.toml> \
+  --output_dir <output_directory> \
+  --output_name <model_output_name> \
+  --save_model_as safetensors \
+  --max_train_steps 10000 \
+  --learning_rate 1e-5 \
+  --optimizer_type AdamW8bit
+```
+
+<details>
+<summary>日本語</summary>
+
+### 各アーキテクチャのFine-tuning
+
+Fine-tuningはモデルの重み全体を更新するため、LoRA学習とは異なるオプションや考慮事項があります。ここでは主要なアーキテクチャごとのFine-tuningスクリプトについて説明します。
+
+基本的なコマンドの構造は、どのアーキテクチャでも共通です。
+
+```bash
+accelerate launch --mixed_precision bf16 {script_name}.py \
+  --pretrained_model_name_or_path <path_to_model> \
+  --dataset_config <path_to_config.toml> \
+  --output_dir <output_directory> \
+  --output_name <model_output_name> \
+  --save_model_as safetensors \
+  --max_train_steps 10000 \
+  --learning_rate 1e-5 \
+  --optimizer_type AdamW8bit
+```
+
+</details>
+
+#### SDXL (`sdxl_train.py`)
+
+Performs fine-tuning for SDXL models. It is possible to train both the U-Net and the Text Encoders.
+
+**Key Options:**
+
+- `--train_text_encoder`: Includes the weights of the Text Encoders (CLIP ViT-L and OpenCLIP ViT-bigG) in the training. Effective for significant style changes or strongly learning specific concepts.
+- `--learning_rate_te1`, `--learning_rate_te2`: Set individual learning rates for each Text Encoder.
+- `--block_lr`: Divides the U-Net into 23 blocks and sets a different learning rate for each block. This allows for advanced adjustments, such as strengthening or weakening the learning of specific layers. (Not available in LoRA tuning).
+
+**Command Example:**
+
+```bash
+accelerate launch --mixed_precision bf16 sdxl_train.py \
+  --pretrained_model_name_or_path "sd_xl_base_1.0.safetensors" \
+  --dataset_config "dataset_config.toml" \
+  --output_dir "output" \
+  --output_name "sdxl_finetuned" \
+  --train_text_encoder \
+  --learning_rate 1e-5 \
+  --learning_rate_te1 5e-6 \
+  --learning_rate_te2 2e-6
+```
+
+<details>
+<summary>日本語</summary>
+
+#### SDXL (`sdxl_train.py`)
+
+SDXLモデルのFine-tuningを行います。U-NetとText Encoderの両方を学習させることが可能です。
+
+**主要なオプション:**
+
+- `--train_text_encoder`: Text Encoder（CLIP ViT-LとOpenCLIP ViT-bigG）の重みを学習対象に含めます。画風を大きく変えたい場合や、特定の概念を強く学習させたい場合に有効です。
+- `--learning_rate_te1`, `--learning_rate_te2`: それぞれのText Encoderに個別の学習率を設定します。
+- `--block_lr`: U-Netを23個のブロックに分割し、ブロックごとに異なる学習率を設定できます。特定の層の学習を強めたり弱めたりする高度な調整が可能です。（LoRA学習では利用できません）
+
+**コマンド例:**
+
+```bash
+accelerate launch --mixed_precision bf16 sdxl_train.py \
+  --pretrained_model_name_or_path "sd_xl_base_1.0.safetensors" \
+  --dataset_config "dataset_config.toml" \
+  --output_dir "output" \
+  --output_name "sdxl_finetuned" \
+  --train_text_encoder \
+  --learning_rate 1e-5 \
+  --learning_rate_te1 5e-6 \
+  --learning_rate_te2 2e-6
+```
+
+</details>
+
+#### SD3 (`sd3_train.py`)
+
+Performs fine-tuning for Stable Diffusion 3 Medium models. SD3 consists of three Text Encoders (CLIP-L, CLIP-G, T5-XXL) and a MMDiT (equivalent to U-Net), which can be targeted for training.
+
+**Key Options:**
+
+- `--train_text_encoder`: Enables training for CLIP-L and CLIP-G.
+- `--train_t5xxl`: Enables training for T5-XXL. T5-XXL is a very large model and requires a lot of VRAM for training.
+- `--blocks_to_swap`: A memory optimization feature to reduce VRAM usage. It swaps some blocks of the MMDiT to CPU memory during training. Useful for using larger batch sizes in low VRAM environments. (Also available in LoRA tuning).
+- `--num_last_block_to_freeze`: Freezes the weights of the last N blocks of the MMDiT, excluding them from training. Useful for maintaining model stability while focusing on learning in the lower layers.
+
+**Command Example:**
+
+```bash
+accelerate launch --mixed_precision bf16 sd3_train.py \
+  --pretrained_model_name_or_path "sd3_medium.safetensors" \
+  --dataset_config "dataset_config.toml" \
+  --output_dir "output" \
+  --output_name "sd3_finetuned" \
+  --train_text_encoder \
+  --learning_rate 4e-6 \
+  --blocks_to_swap 10
+```
+
+<details>
+<summary>日本語</summary>
+
+#### SD3 (`sd3_train.py`)
+
+Stable Diffusion 3 MediumモデルのFine-tuningを行います。SD3は3つのText Encoder（CLIP-L, CLIP-G, T5-XXL）とMMDiT（U-Netに相当）で構成されており、これらを学習対象にできます。
+
+**主要なオプション:**
+
+- `--train_text_encoder`: CLIP-LとCLIP-Gの学習を有効にします。
+- `--train_t5xxl`: T5-XXLの学習を有効にします。T5-XXLは非常に大きなモデルのため、学習には多くのVRAMが必要です。
+- `--blocks_to_swap`: VRAM使用量を削減するためのメモリ最適化機能です。MMDiTの一部のブロックを学習中にCPUメモリに退避（スワップ）させます。VRAMが少ない環境で大きなバッチサイズを使いたい場合に有効です。（LoRA学習でも利用可能）
+- `--num_last_block_to_freeze`: MMDiTの最後のNブロックの重みを凍結し、学習対象から除外します。モデルの安定性を保ちつつ、下位層を中心に学習させたい場合に有効です。
+
+**コマンド例:**
+
+```bash
+accelerate launch --mixed_precision bf16 sd3_train.py \
+  --pretrained_model_name_or_path "sd3_medium.safetensors" \
+  --dataset_config "dataset_config.toml" \
+  --output_dir "output" \
+  --output_name "sd3_finetuned" \
+  --train_text_encoder \
+  --learning_rate 4e-6 \
+  --blocks_to_swap 10
+```
+
+</details>
+
+#### FLUX.1 (`flux_train.py`)
+
+Performs fine-tuning for FLUX.1 models. FLUX.1 is internally composed of two Transformer blocks (Double Blocks, Single Blocks).
+
+**Key Options:**
+
+- `--blocks_to_swap`: Similar to SD3, this feature swaps Transformer blocks to the CPU for memory optimization.
+- `--blockwise_fused_optimizers`: An experimental feature that aims to streamline training by applying individual optimizers to each block.
+
+**Command Example:**
+
+```bash
+accelerate launch --mixed_precision bf16 flux_train.py \
+  --pretrained_model_name_or_path "FLUX.1-dev.safetensors" \
+  --dataset_config "dataset_config.toml" \
+  --output_dir "output" \
+  --output_name "flux1_finetuned" \
+  --learning_rate 1e-5 \
+  --blocks_to_swap 18
+```
+
+<details>
+<summary>日本語</summary>
+
+#### FLUX.1 (`flux_train.py`)
+
+FLUX.1モデルのFine-tuningを行います。FLUX.1は内部的に2つのTransformerブロック（Double Blocks, Single Blocks）で構成されています。
+
+**主要なオプション:**
+
+- `--blocks_to_swap`: SD3と同様に、メモリ最適化のためにTransformerブロックをCPUにスワップする機能です。
+- `--blockwise_fused_optimizers`: 実験的な機能で、各ブロックに個別のオプティマイザを適用し、学習を効率化することを目指します。
+
+**コマンド例:**
+
+```bash
+accelerate launch --mixed_precision bf16 flux_train.py \
+  --pretrained_model_name_or_path "FLUX.1-dev.safetensors" \
+  --dataset_config "dataset_config.toml" \
+  --output_dir "output" \
+  --output_name "flux1_finetuned" \
+  --learning_rate 1e-5 \
+  --blocks_to_swap 18
+```
+
+</details>
+
+#### Lumina (`lumina_train.py`)
+
+Performs fine-tuning for Lumina-Next DiT models.
+
+**Key Options:**
+
+- `--use_flash_attn`: Enables Flash Attention to speed up computation.
+- `lumina_train.py` is relatively new, and many of its options are shared with other scripts. Training can be performed following the basic command pattern.
+
+**Command Example:**
+
+```bash
+accelerate launch --mixed_precision bf16 lumina_train.py \
+  --pretrained_model_name_or_path "Lumina-Next-DiT-B.safetensors" \
+  --dataset_config "dataset_config.toml" \
+  --output_dir "output" \
+  --output_name "lumina_finetuned" \
+  --learning_rate 1e-5
+```
+
+<details>
+<summary>日本語</summary>
+
+#### Lumina (`lumina_train.py`)
+
+Lumina-Next DiTモデルのFine-tuningを行います。
+
+**主要なオプション:**
+
+- `--use_flash_attn`: Flash Attentionを有効にし、計算を高速化します。
+- `lumina_train.py`は比較的新しく、オプションは他のスクリプトと共通化されている部分が多いです。基本的なコマンドパターンに従って学習を行えます。
+
+**コマンド例:**
+
+```bash
+accelerate launch --mixed_precision bf16 lumina_train.py \
+  --pretrained_model_name_or_path "Lumina-Next-DiT-B.safetensors" \
+  --dataset_config "dataset_config.toml" \
+  --output_dir "output" \
+  --output_name "lumina_finetuned" \
+  --learning_rate 1e-5
+```
+
+</details>
+
+--- 
+
+### Differences between Fine-tuning and LoRA tuning per architecture
+
+| Architecture | Key Features/Options Specific to Fine-tuning | Main Differences from LoRA tuning |
+|:---|:---|:---|
+| **SDXL** | `--block_lr` | Only fine-tuning allows for granular control over the learning rate for each U-Net block. |
+| **SD3** | `--train_text_encoder`, `--train_t5xxl`, `--num_last_block_to_freeze` | Only fine-tuning can train the entire Text Encoders. LoRA only trains the adapter parts. |
+| **FLUX.1** | `--blockwise_fused_optimizers` | Since fine-tuning updates the entire model's weights, more experimental optimizer options are available. |
+| **Lumina** | (Few specific options) | Basic training options are common, but fine-tuning differs in that it updates the entire model's foundation. |
+
+<details>
+<summary>日本語</summary>
+
+### アーキテクチャごとのFine-tuningとLoRA学習の違い
+
+| アーキテクチャ | Fine-tuning特有の主要機能・オプション | LoRA学習との主な違い |
+|:---|:---|:---|
+| **SDXL** | `--block_lr` | U-Netのブロックごとに学習率を細かく制御できるのはFine-tuningのみです。 |
+| **SD3** | `--train_text_encoder`, `--train_t5xxl`, `--num_last_block_to_freeze` | Text Encoder全体を学習対象にできるのはFine-tuningです。LoRAではアダプター部分のみ学習します。 |
+| **FLUX.1** | `--blockwise_fused_optimizers` | Fine-tuningではモデル全体の重みを更新するため、より実験的なオプティマイザの選択肢が用意されています。 |
+| **Lumina** | （特有のオプションは少ない） | 基本的な学習オプションは共通ですが、Fine-tuningはモデルの基盤全体を更新する点で異なります。 |
+
+</details>
+
+
+docs\fine_tune_README_ja.md:
+NovelAIの提案した学習手法、自動キャプションニング、タグ付け、Windows＋VRAM 12GB（SD v1.xの場合）環境等に対応したfine tuningです。ここでfine tuningとは、モデルを画像とキャプションで学習することを指します（LoRAやTextual Inversion、Hypernetworksは含みません）
+
+[学習についての共通ドキュメント](./train_README-ja.md) もあわせてご覧ください。
+
+# 概要
+
+Diffusersを用いてStable DiffusionのU-Netのfine tuningを行います。NovelAIの記事にある以下の改善に対応しています（Aspect Ratio BucketingについてはNovelAIのコードを参考にしましたが、最終的なコードはすべてオリジナルです）。
+
+* CLIP（Text Encoder）の最後の層ではなく最後から二番目の層の出力を用いる。
+* 正方形以外の解像度での学習（Aspect Ratio Bucketing） 。
+* トークン長を75から225に拡張する。
+* BLIPによるキャプショニング（キャプションの自動作成）、DeepDanbooruまたはWD14Taggerによる自動タグ付けを行う。
+* Hypernetworkの学習にも対応する。
+* Stable Diffusion v2.0（baseおよび768/v）に対応。
+* VAEの出力をあらかじめ取得しディスクに保存しておくことで、学習の省メモリ化、高速化を図る。
+
+デフォルトではText Encoderの学習は行いません。モデル全体のfine tuningではU-Netだけを学習するのが一般的なようです（NovelAIもそのようです）。オプション指定でText Encoderも学習対象とできます。
+
+# 追加機能について
+
+## CLIPの出力の変更
+
+プロンプトを画像に反映するため、テキストの特徴量への変換を行うのがCLIP（Text Encoder）です。Stable DiffusionではCLIPの最後の層の出力を用いていますが、それを最後から二番目の層の出力を用いるよう変更できます。NovelAIによると、これによりより正確にプロンプトが反映されるようになるとのことです。
+元のまま、最後の層の出力を用いることも可能です。
+
+※Stable Diffusion 2.0では最後から二番目の層をデフォルトで使います。clip_skipオプションを指定しないでください。
+
+## 正方形以外の解像度での学習
+
+Stable Diffusionは512\*512で学習されていますが、それに加えて256\*1024や384\*640といった解像度でも学習します。これによりトリミングされる部分が減り、より正しくプロンプトと画像の関係が学習されることが期待されます。
+学習解像度はパラメータとして与えられた解像度の面積（＝メモリ使用量）を超えない範囲で、64ピクセル単位で縦横に調整、作成されます。
+
+機械学習では入力サイズをすべて統一するのが一般的ですが、特に制約があるわけではなく、実際は同一のバッチ内で統一されていれば大丈夫です。NovelAIの言うbucketingは、あらかじめ教師データを、アスペクト比に応じた学習解像度ごとに分類しておくことを指しているようです。そしてバッチを各bucket内の画像で作成することで、バッチの画像サイズを統一します。
+
+## トークン長の75から225への拡張
+
+Stable Diffusionでは最大75トークン（開始・終了を含むと77トークン）ですが、それを225トークンまで拡張します。
+ただしCLIPが受け付ける最大長は75トークンですので、225トークンの場合、単純に三分割してCLIPを呼び出してから結果を連結しています。
+
+※これが望ましい実装なのかどうかはいまひとつわかりません。とりあえず動いてはいるようです。特に2.0では何も参考になる実装がないので独自に実装してあります。
+
+※Automatic1111氏のWeb UIではカンマを意識して分割、といったこともしているようですが、私の場合はそこまでしておらず単純な分割です。
+
+# 学習の手順
+
+あらかじめこのリポジトリのREADMEを参照し、環境整備を行ってください。
+
+## データの準備
+
+[学習データの準備について](./train_README-ja.md) を参照してください。fine tuningではメタデータを用いるfine tuning方式のみ対応しています。
+
+## 学習の実行
+たとえば以下のように実行します。以下は省メモリ化のための設定です。それぞれの行を必要に応じて書き換えてください。
+
+```
+accelerate launch --num_cpu_threads_per_process 1 fine_tune.py 
+    --pretrained_model_name_or_path=<.ckptまたは.safetensordまたはDiffusers版モデルのディレクトリ> 
+    --output_dir=<学習したモデルの出力先フォルダ>  
+    --output_name=<学習したモデル出力時のファイル名> 
+    --dataset_config=<データ準備で作成した.tomlファイル> 
+    --save_model_as=safetensors 
+    --learning_rate=5e-6 --max_train_steps=10000 
+    --use_8bit_adam --xformers --gradient_checkpointing
+    --mixed_precision=fp16
+```
+
+`num_cpu_threads_per_process` には通常は1を指定するとよいようです。
+
+`pretrained_model_name_or_path` に追加学習を行う元となるモデルを指定します。Stable Diffusionのcheckpointファイル（.ckptまたは.safetensors）、Diffusersのローカルディスクにあるモデルディレクトリ、DiffusersのモデルID（"stabilityai/stable-diffusion-2"など）が指定できます。
+
+`output_dir` に学習後のモデルを保存するフォルダを指定します。`output_name` にモデルのファイル名を拡張子を除いて指定します。`save_model_as` でsafetensors形式での保存を指定しています。
+
+`dataset_config` に `.toml` ファイルを指定します。ファイル内でのバッチサイズ指定は、当初はメモリ消費を抑えるために `1` としてください。
+
+学習させるステップ数 `max_train_steps` を10000とします。学習率 `learning_rate` はここでは5e-6を指定しています。
+
+省メモリ化のため `mixed_precision="fp16"` を指定します（RTX30 シリーズ以降では `bf16` も指定できます。環境整備時にaccelerateに行った設定と合わせてください）。また `gradient_checkpointing` を指定します。
+
+オプティマイザ（モデルを学習データにあうように最適化＝学習させるクラス）にメモリ消費の少ない 8bit AdamW を使うため、 `optimizer_type="AdamW8bit"` を指定します。
+
+`xformers` オプションを指定し、xformersのCrossAttentionを用います。xformersをインストールしていない場合やエラーとなる場合（環境にもよりますが `mixed_precision="no"` の場合など）、代わりに `mem_eff_attn` オプションを指定すると省メモリ版CrossAttentionを使用します（速度は遅くなります）。
+
+ある程度メモリがある場合は、`.toml` ファイルを編集してバッチサイズをたとえば `4` くらいに増やしてください（高速化と精度向上の可能性があります）。
+
+### よく使われるオプションについて
+
+以下の場合にはオプションに関するドキュメントを参照してください。
+
+- Stable Diffusion 2.xまたはそこからの派生モデルを学習する
+- clip skipを2以上を前提としたモデルを学習する
+- 75トークンを超えたキャプションで学習する
+
+### バッチサイズについて
+
+モデル全体を学習するためLoRA等の学習に比べるとメモリ消費量は多くなります（DreamBoothと同じ）。
+
+### 学習率について
+
+1e-6から5e-6程度が一般的なようです。他のfine tuningの例なども参照してみてください。
+
+### 以前の形式のデータセット指定をした場合のコマンドライン
+
+解像度やバッチサイズをオプションで指定します。コマンドラインの例は以下の通りです。
+
+```
+accelerate launch --num_cpu_threads_per_process 1 fine_tune.py 
+    --pretrained_model_name_or_path=model.ckpt 
+    --in_json meta_lat.json 
+    --train_data_dir=train_data 
+    --output_dir=fine_tuned 
+    --shuffle_caption 
+    --train_batch_size=1 --learning_rate=5e-6 --max_train_steps=10000 
+    --use_8bit_adam --xformers --gradient_checkpointing
+    --mixed_precision=bf16
+    --save_every_n_epochs=4
+```
+
+<!-- 
+### 勾配をfp16とした学習（実験的機能）
+full_fp16オプションを指定すると勾配を通常のfloat32からfloat16（fp16）に変更して学習します（mixed precisionではなく完全なfp16学習になるようです）。これによりSD1.xの512*512サイズでは8GB未満、SD2.xの512*512サイズで12GB未満のVRAM使用量で学習できるようです。
+
+あらかじめaccelerate configでfp16を指定し、オプションでmixed_precision="fp16"としてください（bf16では動作しません）。
+
+メモリ使用量を最小化するためには、xformers、use_8bit_adam、gradient_checkpointingの各オプションを指定し、train_batch_sizeを1としてください。
+（余裕があるようならtrain_batch_sizeを段階的に増やすと若干精度が上がるはずです。）
+
+PyTorchのソースにパッチを当てて無理やり実現しています（PyTorch 1.12.1と1.13.0で確認）。精度はかなり落ちますし、途中で学習失敗する確率も高くなります。学習率やステップ数の設定もシビアなようです。それらを認識したうえで自己責任でお使いください。
+-->
+
+# fine tuning特有のその他の主なオプション
+
+すべてのオプションについては別文書を参照してください。
+
+## `train_text_encoder`
+Text Encoderも学習対象とします。メモリ使用量が若干増加します。
+
+通常のfine tuningではText Encoderは学習対象としませんが（恐らくText Encoderの出力に従うようにU-Netを学習するため）、学習データ数が少ない場合には、DreamBoothのようにText Encoder側に学習させるのも有効的なようです。
+
+## `diffusers_xformers`
+スクリプト独自のxformers置換機能ではなくDiffusersのxformers機能を利用します。Hypernetworkの学習はできなくなります。
+
+

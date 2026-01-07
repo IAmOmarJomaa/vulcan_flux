@@ -1,0 +1,1103 @@
+tools\convert_diffusers20_original_sd.py:
+# convert Diffusers v1.x/v2.0 model to original Stable Diffusion
+
+import argparse
+import os
+import torch
+from diffusers import StableDiffusionPipeline
+
+import library.model_util as model_util
+from library.utils import setup_logging
+setup_logging()
+import logging
+logger = logging.getLogger(__name__)
+
+def convert(args):
+    # 引数を確認する
+    load_dtype = torch.float16 if args.fp16 else None
+
+    save_dtype = None
+    if args.fp16 or args.save_precision_as == "fp16":
+        save_dtype = torch.float16
+    elif args.bf16 or args.save_precision_as == "bf16":
+        save_dtype = torch.bfloat16
+    elif args.float or args.save_precision_as == "float":
+        save_dtype = torch.float
+
+    is_load_ckpt = os.path.isfile(args.model_to_load)
+    is_save_ckpt = len(os.path.splitext(args.model_to_save)[1]) > 0
+
+    assert not is_load_ckpt or args.v1 != args.v2, "v1 or v2 is required to load checkpoint / checkpointの読み込みにはv1/v2指定が必要です"
+    # assert (
+    #     is_save_ckpt or args.reference_model is not None
+    # ), f"reference model is required to save as Diffusers / Diffusers形式での保存には参照モデルが必要です"
+
+    # モデルを読み込む
+    msg = "checkpoint" if is_load_ckpt else ("Diffusers" + (" as fp16" if args.fp16 else ""))
+    logger.info(f"loading {msg}: {args.model_to_load}")
+
+    if is_load_ckpt:
+        v2_model = args.v2
+        text_encoder, vae, unet = model_util.load_models_from_stable_diffusion_checkpoint(
+            v2_model, args.model_to_load, unet_use_linear_projection_in_v2=args.unet_use_linear_projection
+        )
+    else:
+        pipe = StableDiffusionPipeline.from_pretrained(
+            args.model_to_load, torch_dtype=load_dtype, tokenizer=None, safety_checker=None, variant=args.variant
+        )
+        text_encoder = pipe.text_encoder
+        vae = pipe.vae
+        unet = pipe.unet
+
+        if args.v1 == args.v2:
+            # 自動判定する
+            v2_model = unet.config.cross_attention_dim == 1024
+            logger.info("checking model version: model is " + ("v2" if v2_model else "v1"))
+        else:
+            v2_model = not args.v1
+
+    # 変換して保存する
+    msg = ("checkpoint" + ("" if save_dtype is None else f" in {save_dtype}")) if is_save_ckpt else "Diffusers"
+    logger.info(f"converting and saving as {msg}: {args.model_to_save}")
+
+    if is_save_ckpt:
+        original_model = args.model_to_load if is_load_ckpt else None
+        key_count = model_util.save_stable_diffusion_checkpoint(
+            v2_model,
+            args.model_to_save,
+            text_encoder,
+            unet,
+            original_model,
+            args.epoch,
+            args.global_step,
+            None if args.metadata is None else eval(args.metadata),
+            save_dtype=save_dtype,
+            vae=vae,
+        )
+        logger.info(f"model saved. total converted state_dict keys: {key_count}")
+    else:
+        logger.info(
+            f"copy scheduler/tokenizer config from: {args.reference_model if args.reference_model is not None else 'default model'}"
+        )
+        model_util.save_diffusers_checkpoint(
+            v2_model, args.model_to_save, text_encoder, unet, args.reference_model, vae, args.use_safetensors
+        )
+        logger.info("model saved.")
+
+
+def setup_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--v1", action="store_true", help="load v1.x model (v1 or v2 is required to load checkpoint) / 1.xのモデルを読み込む"
+    )
+    parser.add_argument(
+        "--v2", action="store_true", help="load v2.0 model (v1 or v2 is required to load checkpoint) / 2.0のモデルを読み込む"
+    )
+    parser.add_argument(
+        "--unet_use_linear_projection",
+        action="store_true",
+        help="When saving v2 model as Diffusers, set U-Net config to `use_linear_projection=true` (to match stabilityai's model) / Diffusers形式でv2モデルを保存するときにU-Netの設定を`use_linear_projection=true`にする（stabilityaiのモデルと合わせる）",
+    )
+    parser.add_argument(
+        "--fp16",
+        action="store_true",
+        help="load as fp16 (Diffusers only) and save as fp16 (checkpoint only) / fp16形式で読み込み（Diffusers形式のみ対応）、保存する（checkpointのみ対応）",
+    )
+    parser.add_argument("--bf16", action="store_true", help="save as bf16 (checkpoint only) / bf16形式で保存する（checkpointのみ対応）")
+    parser.add_argument(
+        "--float", action="store_true", help="save as float (checkpoint only) / float(float32)形式で保存する（checkpointのみ対応）"
+    )
+    parser.add_argument(
+        "--save_precision_as",
+        type=str,
+        default="no",
+        choices=["fp16", "bf16", "float"],
+        help="save precision, do not specify with --fp16/--bf16/--float / 保存する精度、--fp16/--bf16/--floatと併用しないでください",
+    )
+    parser.add_argument("--epoch", type=int, default=0, help="epoch to write to checkpoint / checkpointに記録するepoch数の値")
+    parser.add_argument(
+        "--global_step", type=int, default=0, help="global_step to write to checkpoint / checkpointに記録するglobal_stepの値"
+    )
+    parser.add_argument(
+        "--metadata",
+        type=str,
+        default=None,
+        help='モデルに保存されるメタデータ、Pythonの辞書形式で指定 / metadata: metadata written in to the model in Python Dictionary. Example metadata: \'{"name": "model_name", "resolution": "512x512"}\'',
+    )
+    parser.add_argument(
+        "--variant",
+        type=str,
+        default=None,
+        help="読む込むDiffusersのvariantを指定する、例: fp16 / variant: Diffusers variant to load. Example: fp16",
+    )
+    parser.add_argument(
+        "--reference_model",
+        type=str,
+        default=None,
+        help="scheduler/tokenizerのコピー元Diffusersモデル、Diffusers形式で保存するときに使用される、省略時は`runwayml/stable-diffusion-v1-5` または `stabilityai/stable-diffusion-2-1` / reference Diffusers model to copy scheduler/tokenizer config from, used when saving as Diffusers format, default is `runwayml/stable-diffusion-v1-5` or `stabilityai/stable-diffusion-2-1`",
+    )
+    parser.add_argument(
+        "--use_safetensors",
+        action="store_true",
+        help="use safetensors format to save Diffusers model (checkpoint depends on the file extension) / Duffusersモデルをsafetensors形式で保存する（checkpointは拡張子で自動判定）",
+    )
+
+    parser.add_argument(
+        "model_to_load",
+        type=str,
+        default=None,
+        help="model to load: checkpoint file or Diffusers model's directory / 読み込むモデル、checkpointかDiffusers形式モデルのディレクトリ",
+    )
+    parser.add_argument(
+        "model_to_save",
+        type=str,
+        default=None,
+        help="model to save: checkpoint (with extension) or Diffusers model's directory (without extension) / 変換後のモデル、拡張子がある場合はcheckpoint、ない場合はDiffusesモデルとして保存",
+    )
+    return parser
+
+
+if __name__ == "__main__":
+    parser = setup_parser()
+
+    args = parser.parse_args()
+    convert(args)
+
+
+tools\convert_diffusers_to_flux.py:
+# This script converts the diffusers of a Flux model to a safetensors file of a Flux.1 model.
+# It is based on the implementation by 2kpr. Thanks to 2kpr!
+# Major changes:
+# - Iterates over three safetensors files to reduce memory usage, not loading all tensors at once.
+# - Makes reverse map from diffusers map to avoid loading all tensors.
+# - Removes dependency on .json file for weights mapping.
+# - Adds support for custom memory efficient load and save functions.
+# - Supports saving with different precision.
+# - Supports .safetensors file as input.
+
+# Copyright 2024 2kpr. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+
+import argparse
+import os
+from pathlib import Path
+import safetensors
+from safetensors.torch import safe_open
+import torch
+from tqdm import tqdm
+
+from library import flux_utils
+from library.utils import setup_logging, str_to_dtype
+from library.safetensors_utils import MemoryEfficientSafeOpen, mem_eff_save_file
+
+setup_logging()
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+def convert(args):
+    # if diffusers_path is folder, get safetensors file
+    diffusers_path = Path(args.diffusers_path)
+    if diffusers_path.is_dir():
+        diffusers_path = Path.joinpath(diffusers_path, "transformer", "diffusion_pytorch_model-00001-of-00003.safetensors")
+
+    flux_path = Path(args.save_to)
+    if not os.path.exists(flux_path.parent):
+        os.makedirs(flux_path.parent)
+
+    if not diffusers_path.exists():
+        logger.error(f"Error: Missing transformer safetensors file: {diffusers_path}")
+        return
+
+    mem_eff_flag = args.mem_eff_load_save
+    save_dtype = str_to_dtype(args.save_precision) if args.save_precision is not None else None
+
+    # make reverse map from diffusers map
+    diffusers_to_bfl_map = flux_utils.make_diffusers_to_bfl_map(19, 38)
+
+    # iterate over three safetensors files to reduce memory usage
+    flux_sd = {}
+    for i in range(3):
+        # replace 00001 with 0000i
+        current_diffusers_path = Path(str(diffusers_path).replace("00001", f"0000{i+1}"))
+        logger.info(f"Loading diffusers file: {current_diffusers_path}")
+
+        open_func = MemoryEfficientSafeOpen if mem_eff_flag else (lambda x: safe_open(x, framework="pt"))
+        with open_func(current_diffusers_path) as f:
+            for diffusers_key in tqdm(f.keys()):
+                if diffusers_key in diffusers_to_bfl_map:
+                    tensor = f.get_tensor(diffusers_key).to("cpu")
+                    if save_dtype is not None:
+                        tensor = tensor.to(save_dtype)
+
+                    index, bfl_key = diffusers_to_bfl_map[diffusers_key]
+                    if bfl_key not in flux_sd:
+                        flux_sd[bfl_key] = []
+                    flux_sd[bfl_key].append((index, tensor))
+                else:
+                    logger.error(f"Error: Key not found in diffusers_to_bfl_map: {diffusers_key}")
+                    return
+
+    # concat tensors if multiple tensors are mapped to a single key, sort by index
+    for key, values in flux_sd.items():
+        if len(values) == 1:
+            flux_sd[key] = values[0][1]
+        else:
+            flux_sd[key] = torch.cat([value[1] for value in sorted(values, key=lambda x: x[0])])
+
+    # special case for final_layer.adaLN_modulation.1.weight and final_layer.adaLN_modulation.1.bias
+    def swap_scale_shift(weight):
+        shift, scale = weight.chunk(2, dim=0)
+        new_weight = torch.cat([scale, shift], dim=0)
+        return new_weight
+
+    if "final_layer.adaLN_modulation.1.weight" in flux_sd:
+        flux_sd["final_layer.adaLN_modulation.1.weight"] = swap_scale_shift(flux_sd["final_layer.adaLN_modulation.1.weight"])
+    if "final_layer.adaLN_modulation.1.bias" in flux_sd:
+        flux_sd["final_layer.adaLN_modulation.1.bias"] = swap_scale_shift(flux_sd["final_layer.adaLN_modulation.1.bias"])
+
+    # save flux_sd to safetensors file
+    logger.info(f"Saving Flux safetensors file: {flux_path}")
+    if mem_eff_flag:
+        mem_eff_save_file(flux_sd, flux_path)
+    else:
+        safetensors.torch.save_file(flux_sd, flux_path)
+
+    logger.info("Conversion completed.")
+
+
+def setup_parser():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--diffusers_path",
+        default=None,
+        type=str,
+        required=True,
+        help="Path to the original Flux diffusers folder or *-00001-of-00003.safetensors file."
+        " / 元のFlux diffusersフォルダーまたは*-00001-of-00003.safetensorsファイルへのパス",
+    )
+    parser.add_argument(
+        "--save_to",
+        default=None,
+        type=str,
+        required=True,
+        help="Output path for the Flux safetensors file. / Flux safetensorsファイルの出力先",
+    )
+    parser.add_argument(
+        "--mem_eff_load_save",
+        action="store_true",
+        help="use custom memory efficient load and save functions for FLUX.1 model"
+        " / カスタムのメモリ効率の良い読み込みと保存関数をFLUX.1モデルに使用する",
+    )
+    parser.add_argument(
+        "--save_precision",
+        type=str,
+        default=None,
+        help="precision in saving, default is same as loading precision"
+        "float32, fp16, bf16, fp8 (same as fp8_e4m3fn), fp8_e4m3fn, fp8_e4m3fnuz, fp8_e5m2, fp8_e5m2fnuz"
+        " / 保存時に精度を変更して保存する、デフォルトは読み込み時と同じ精度",
+    )
+    return parser
+
+
+if __name__ == "__main__":
+    parser = setup_parser()
+    args = parser.parse_args()
+    convert(args)
+
+
+tools\detect_face_rotate.py:
+# このスクリプトのライセンスは、train_dreambooth.pyと同じくApache License 2.0とします
+# (c) 2022 Kohya S. @kohya_ss
+
+# 横長の画像から顔検出して正立するように回転し、そこを中心に正方形に切り出す
+
+# v2: extract max face if multiple faces are found
+# v3: add crop_ratio option
+# v4: add multiple faces extraction and min/max size
+
+import argparse
+import math
+import cv2
+import glob
+import os
+from anime_face_detector import create_detector
+from tqdm import tqdm
+import numpy as np
+from library.utils import setup_logging, resize_image
+setup_logging()
+import logging
+logger = logging.getLogger(__name__)
+
+KP_REYE = 11
+KP_LEYE = 19
+
+SCORE_THRES = 0.90
+
+
+def detect_faces(detector, image, min_size):
+  preds = detector(image)                     # bgr
+  # logger.info(len(preds))
+
+  faces = []
+  for pred in preds:
+    bb = pred['bbox']
+    score = bb[-1]
+    if score < SCORE_THRES:
+      continue
+
+    left, top, right, bottom = bb[:4]
+    cx = int((left + right) / 2)
+    cy = int((top + bottom) / 2)
+    fw = int(right - left)
+    fh = int(bottom - top)
+
+    lex, ley = pred['keypoints'][KP_LEYE, 0:2]
+    rex, rey = pred['keypoints'][KP_REYE, 0:2]
+    angle = math.atan2(ley - rey, lex - rex)
+    angle = angle / math.pi * 180
+
+    faces.append((cx, cy, fw, fh, angle))
+
+  faces.sort(key=lambda x: max(x[2], x[3]), reverse=True)         # 大きい順
+  return faces
+
+
+def rotate_image(image, angle, cx, cy):
+  h, w = image.shape[0:2]
+  rot_mat = cv2.getRotationMatrix2D((cx, cy), angle, 1.0)
+
+  # # 回転する分、すこし画像サイズを大きくする→とりあえず無効化
+  # nh = max(h, int(w * math.sin(angle)))
+  # nw = max(w, int(h * math.sin(angle)))
+  # if nh > h or nw > w:
+  #   pad_y = nh - h
+  #   pad_t = pad_y // 2
+  #   pad_x = nw - w
+  #   pad_l = pad_x // 2
+  #   m = np.array([[0, 0, pad_l],
+  #                 [0, 0, pad_t]])
+  #   rot_mat = rot_mat + m
+  #   h, w = nh, nw
+  #   cx += pad_l
+  #   cy += pad_t
+
+  result = cv2.warpAffine(image, rot_mat, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+  return result, cx, cy
+
+
+def process(args):
+  assert (not args.resize_fit) or args.resize_face_size is None, f"resize_fit and resize_face_size can't be specified both / resize_fitとresize_face_sizeはどちらか片方しか指定できません"
+  assert args.crop_ratio is None or args.resize_face_size is None, f"crop_ratio指定時はresize_face_sizeは指定できません"
+
+  # アニメ顔検出モデルを読み込む
+  logger.info("loading face detector.")
+  detector = create_detector('yolov3')
+
+  # cropの引数を解析する
+  if args.crop_size is None:
+    crop_width = crop_height = None
+  else:
+    tokens = args.crop_size.split(',')
+    assert len(tokens) == 2, f"crop_size must be 'width,height' / crop_sizeは'幅,高さ'で指定してください"
+    crop_width, crop_height = [int(t) for t in tokens]
+
+  if args.crop_ratio is None:
+    crop_h_ratio = crop_v_ratio = None
+  else:
+    tokens = args.crop_ratio.split(',')
+    assert len(tokens) == 2, f"crop_ratio must be 'horizontal,vertical' / crop_ratioは'幅,高さ'の倍率で指定してください"
+    crop_h_ratio, crop_v_ratio = [float(t) for t in tokens]
+
+  # 画像を処理する
+  logger.info("processing.")
+  output_extension = ".png"
+
+  os.makedirs(args.dst_dir, exist_ok=True)
+  paths = glob.glob(os.path.join(args.src_dir, "*.png")) + glob.glob(os.path.join(args.src_dir, "*.jpg")) + \
+      glob.glob(os.path.join(args.src_dir, "*.webp"))
+  for path in tqdm(paths):
+    basename = os.path.splitext(os.path.basename(path))[0]
+
+    # image = cv2.imread(path)        # 日本語ファイル名でエラーになる
+    image = cv2.imdecode(np.fromfile(path, np.uint8), cv2.IMREAD_UNCHANGED)
+    if len(image.shape) == 2:
+      image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    if image.shape[2] == 4:
+      logger.warning(f"image has alpha. ignore / 画像の透明度が設定されているため無視します: {path}")
+      image = image[:, :, :3].copy()                    # copyをしないと内部的に透明度情報が付いたままになるらしい
+
+    h, w = image.shape[:2]
+
+    faces = detect_faces(detector, image, args.multiple_faces)
+    for i, face in enumerate(faces):
+      cx, cy, fw, fh, angle = face
+      face_size = max(fw, fh)
+      if args.min_size is not None and face_size < args.min_size:
+        continue
+      if args.max_size is not None and face_size >= args.max_size:
+        continue
+      face_suffix = f"_{i+1:02d}" if args.multiple_faces else ""
+
+      # オプション指定があれば回転する
+      face_img = image
+      if args.rotate:
+        face_img, cx, cy = rotate_image(face_img, angle, cx, cy)
+
+      # オプション指定があれば顔を中心に切り出す
+      if crop_width is not None or crop_h_ratio is not None:
+        cur_crop_width, cur_crop_height = crop_width, crop_height
+        if crop_h_ratio is not None:
+          cur_crop_width = int(face_size * crop_h_ratio + .5)
+          cur_crop_height = int(face_size * crop_v_ratio + .5)
+
+        # リサイズを必要なら行う
+        scale = 1.0
+        if args.resize_face_size is not None:
+          # 顔サイズを基準にリサイズする
+          scale = args.resize_face_size / face_size
+          if scale < cur_crop_width / w:
+            logger.warning(
+                f"image width too small in face size based resizing / 顔を基準にリサイズすると画像の幅がcrop sizeより小さい（顔が相対的に大きすぎる）ので顔サイズが変わります: {path}")
+            scale = cur_crop_width / w
+          if scale < cur_crop_height / h:
+            logger.warning(
+                f"image height too small in face size based resizing / 顔を基準にリサイズすると画像の高さがcrop sizeより小さい（顔が相対的に大きすぎる）ので顔サイズが変わります: {path}")
+            scale = cur_crop_height / h
+        elif crop_h_ratio is not None:
+          # 倍率指定の時にはリサイズしない
+          pass
+        else:
+          # 切り出しサイズ指定あり
+          if w < cur_crop_width:
+            logger.warning(f"image width too small/ 画像の幅がcrop sizeより小さいので画質が劣化します: {path}")
+            scale = cur_crop_width / w
+          if h < cur_crop_height:
+            logger.warning(f"image height too small/ 画像の高さがcrop sizeより小さいので画質が劣化します: {path}")
+            scale = cur_crop_height / h
+          if args.resize_fit:
+            scale = max(cur_crop_width / w, cur_crop_height / h)
+
+        if scale != 1.0:
+          rw = int(w * scale + .5)
+          rh = int(h * scale + .5)
+          face_img = resize_image(face_img, w, h, rw, rh)
+          cx = int(cx * scale + .5)
+          cy = int(cy * scale + .5)
+          fw = int(fw * scale + .5)
+          fh = int(fh * scale + .5)
+
+        cur_crop_width = min(cur_crop_width, face_img.shape[1])
+        cur_crop_height = min(cur_crop_height, face_img.shape[0])
+
+        x = cx - cur_crop_width // 2
+        cx = cur_crop_width // 2
+        if x < 0:
+          cx = cx + x
+          x = 0
+        elif x + cur_crop_width > w:
+          cx = cx + (x + cur_crop_width - w)
+          x = w - cur_crop_width
+        face_img = face_img[:, x:x+cur_crop_width]
+
+        y = cy - cur_crop_height // 2
+        cy = cur_crop_height // 2
+        if y < 0:
+          cy = cy + y
+          y = 0
+        elif y + cur_crop_height > h:
+          cy = cy + (y + cur_crop_height - h)
+          y = h - cur_crop_height
+        face_img = face_img[y:y + cur_crop_height]
+
+      # # debug
+      # logger.info(path, cx, cy, angle)
+      # crp = cv2.resize(image, (image.shape[1]//8, image.shape[0]//8))
+      # cv2.imshow("image", crp)
+      # if cv2.waitKey() == 27:
+      #   break
+      # cv2.destroyAllWindows()
+
+      # debug
+      if args.debug:
+        cv2.rectangle(face_img, (cx-fw//2, cy-fh//2), (cx+fw//2, cy+fh//2), (255, 0, 255), fw//20)
+
+      _, buf = cv2.imencode(output_extension, face_img)
+      with open(os.path.join(args.dst_dir, f"{basename}{face_suffix}_{cx:04d}_{cy:04d}_{fw:04d}_{fh:04d}{output_extension}"), "wb") as f:
+        buf.tofile(f)
+
+
+def setup_parser() -> argparse.ArgumentParser:
+  parser = argparse.ArgumentParser()
+  parser.add_argument("--src_dir", type=str, help="directory to load images / 画像を読み込むディレクトリ")
+  parser.add_argument("--dst_dir", type=str, help="directory to save images / 画像を保存するディレクトリ")
+  parser.add_argument("--rotate", action="store_true", help="rotate images to align faces / 顔が正立するように画像を回転する")
+  parser.add_argument("--resize_fit", action="store_true",
+                      help="resize to fit smaller side after cropping / 切り出し後の画像の短辺がcrop_sizeにあうようにリサイズする")
+  parser.add_argument("--resize_face_size", type=int, default=None,
+                      help="resize image before cropping by face size / 切り出し前に顔がこのサイズになるようにリサイズする")
+  parser.add_argument("--crop_size", type=str, default=None,
+                      help="crop images with 'width,height' pixels, face centered / 顔を中心として'幅,高さ'のサイズで切り出す")
+  parser.add_argument("--crop_ratio", type=str, default=None,
+                      help="crop images with 'horizontal,vertical' ratio to face, face centered / 顔を中心として顔サイズの'幅倍率,高さ倍率'のサイズで切り出す")
+  parser.add_argument("--min_size", type=int, default=None,
+                      help="minimum face size to output (included) / 処理対象とする顔の最小サイズ（この値以上）")
+  parser.add_argument("--max_size", type=int, default=None,
+                      help="maximum face size to output (excluded) / 処理対象とする顔の最大サイズ（この値未満）")
+  parser.add_argument("--multiple_faces", action="store_true",
+                      help="output each faces / 複数の顔が見つかった場合、それぞれを切り出す")
+  parser.add_argument("--debug", action="store_true", help="render rect for face / 処理後画像の顔位置に矩形を描画します")
+
+  return parser
+
+
+if __name__ == '__main__':
+  parser = setup_parser()
+
+  args = parser.parse_args()
+
+  process(args)
+
+
+tools\latent_upscaler.py:
+# 外部から簡単にupscalerを呼ぶためのスクリプト
+# 単体で動くようにモデル定義も含めている
+
+import argparse
+import glob
+import os
+import cv2
+from diffusers import AutoencoderKL
+
+from typing import Dict, List
+import numpy as np
+
+import torch
+from library.device_utils import init_ipex, get_preferred_device
+init_ipex()
+
+from torch import nn
+from tqdm import tqdm
+from PIL import Image
+from library.utils import setup_logging
+setup_logging()
+import logging
+logger = logging.getLogger(__name__)
+
+class ResidualBlock(nn.Module):
+    def __init__(self, in_channels, out_channels=None, kernel_size=3, stride=1, padding=1):
+        super(ResidualBlock, self).__init__()
+
+        if out_channels is None:
+            out_channels = in_channels
+
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu1 = nn.ReLU(inplace=True)
+
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size, stride, padding, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+
+        self.relu2 = nn.ReLU(inplace=True)  # このReLUはresidualに足す前にかけるほうがいいかも
+
+        # initialize weights
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        residual = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu1(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        out += residual
+
+        out = self.relu2(out)
+
+        return out
+
+
+class Upscaler(nn.Module):
+    def __init__(self):
+        super(Upscaler, self).__init__()
+
+        # define layers
+        # latent has 4 channels
+
+        self.conv1 = nn.Conv2d(4, 128, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+        self.bn1 = nn.BatchNorm2d(128)
+        self.relu1 = nn.ReLU(inplace=True)
+
+        # resblocks
+        # 数の暴力で20個：次元数を増やすよりもブロックを増やしたほうがreceptive fieldが広がるはずだぞ
+        self.resblock1 = ResidualBlock(128)
+        self.resblock2 = ResidualBlock(128)
+        self.resblock3 = ResidualBlock(128)
+        self.resblock4 = ResidualBlock(128)
+        self.resblock5 = ResidualBlock(128)
+        self.resblock6 = ResidualBlock(128)
+        self.resblock7 = ResidualBlock(128)
+        self.resblock8 = ResidualBlock(128)
+        self.resblock9 = ResidualBlock(128)
+        self.resblock10 = ResidualBlock(128)
+        self.resblock11 = ResidualBlock(128)
+        self.resblock12 = ResidualBlock(128)
+        self.resblock13 = ResidualBlock(128)
+        self.resblock14 = ResidualBlock(128)
+        self.resblock15 = ResidualBlock(128)
+        self.resblock16 = ResidualBlock(128)
+        self.resblock17 = ResidualBlock(128)
+        self.resblock18 = ResidualBlock(128)
+        self.resblock19 = ResidualBlock(128)
+        self.resblock20 = ResidualBlock(128)
+
+        # last convs
+        self.conv2 = nn.Conv2d(128, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+        self.bn2 = nn.BatchNorm2d(64)
+        self.relu2 = nn.ReLU(inplace=True)
+
+        self.conv3 = nn.Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+        self.bn3 = nn.BatchNorm2d(64)
+        self.relu3 = nn.ReLU(inplace=True)
+
+        # final conv: output 4 channels
+        self.conv_final = nn.Conv2d(64, 4, kernel_size=(1, 1), stride=(1, 1), padding=(0, 0))
+
+        # initialize weights
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                nn.init.constant_(m.bias, 0)
+
+        # initialize final conv weights to 0: 流行りのzero conv
+        nn.init.constant_(self.conv_final.weight, 0)
+
+    def forward(self, x):
+        inp = x
+
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu1(x)
+
+        # いくつかのresblockを通した後に、residualを足すことで精度向上と学習速度向上が見込めるはず
+        residual = x
+        x = self.resblock1(x)
+        x = self.resblock2(x)
+        x = self.resblock3(x)
+        x = self.resblock4(x)
+        x = x + residual
+        residual = x
+        x = self.resblock5(x)
+        x = self.resblock6(x)
+        x = self.resblock7(x)
+        x = self.resblock8(x)
+        x = x + residual
+        residual = x
+        x = self.resblock9(x)
+        x = self.resblock10(x)
+        x = self.resblock11(x)
+        x = self.resblock12(x)
+        x = x + residual
+        residual = x
+        x = self.resblock13(x)
+        x = self.resblock14(x)
+        x = self.resblock15(x)
+        x = self.resblock16(x)
+        x = x + residual
+        residual = x
+        x = self.resblock17(x)
+        x = self.resblock18(x)
+        x = self.resblock19(x)
+        x = self.resblock20(x)
+        x = x + residual
+
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = self.relu2(x)
+        x = self.conv3(x)
+        x = self.bn3(x)
+
+        # ここにreluを入れないほうがいい気がする
+
+        x = self.conv_final(x)
+
+        # network estimates the difference between the input and the output
+        x = x + inp
+
+        return x
+
+    def support_latents(self) -> bool:
+        return False
+
+    def upscale(
+        self,
+        vae: AutoencoderKL,
+        lowreso_images: List[Image.Image],
+        lowreso_latents: torch.Tensor,
+        dtype: torch.dtype,
+        width: int,
+        height: int,
+        batch_size: int = 1,
+        vae_batch_size: int = 1,
+    ):
+        # assertion
+        assert lowreso_images is not None, "Upscaler requires lowreso image"
+
+        # make upsampled image with lanczos4
+        upsampled_images = []
+        for lowreso_image in lowreso_images:
+            upsampled_image = np.array(lowreso_image.resize((width, height), Image.LANCZOS))
+            upsampled_images.append(upsampled_image)
+
+        # convert to tensor: this tensor is too large to be converted to cuda
+        upsampled_images = [torch.from_numpy(upsampled_image).permute(2, 0, 1).float() for upsampled_image in upsampled_images]
+        upsampled_images = torch.stack(upsampled_images, dim=0)
+        upsampled_images = upsampled_images.to(dtype)
+
+        # normalize to [-1, 1]
+        upsampled_images = upsampled_images / 127.5 - 1.0
+
+        # convert upsample images to latents with batch size
+        # logger.info("Encoding upsampled (LANCZOS4) images...")
+        upsampled_latents = []
+        for i in tqdm(range(0, upsampled_images.shape[0], vae_batch_size)):
+            batch = upsampled_images[i : i + vae_batch_size].to(vae.device)
+            with torch.no_grad():
+                batch = vae.encode(batch).latent_dist.sample()
+            upsampled_latents.append(batch)
+
+        upsampled_latents = torch.cat(upsampled_latents, dim=0)
+
+        # upscale (refine) latents with this model with batch size
+        logger.info("Upscaling latents...")
+        upscaled_latents = []
+        for i in range(0, upsampled_latents.shape[0], batch_size):
+            with torch.no_grad():
+                upscaled_latents.append(self.forward(upsampled_latents[i : i + batch_size]))
+        upscaled_latents = torch.cat(upscaled_latents, dim=0)
+
+        return upscaled_latents * 0.18215
+
+
+# external interface: returns a model
+def create_upscaler(**kwargs):
+    weights = kwargs["weights"]
+    model = Upscaler()
+
+    logger.info(f"Loading weights from {weights}...")
+    if os.path.splitext(weights)[1] == ".safetensors":
+        from safetensors.torch import load_file
+
+        sd = load_file(weights)
+    else:
+        sd = torch.load(weights, map_location=torch.device("cpu"))
+    model.load_state_dict(sd)
+    return model
+
+
+# another interface: upscale images with a model for given images from command line
+def upscale_images(args: argparse.Namespace):
+    DEVICE = get_preferred_device()
+    us_dtype = torch.float16  # TODO: support fp32/bf16
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # load VAE with Diffusers
+    assert args.vae_path is not None, "VAE path is required"
+    logger.info(f"Loading VAE from {args.vae_path}...")
+    vae = AutoencoderKL.from_pretrained(args.vae_path, subfolder="vae")
+    vae.to(DEVICE, dtype=us_dtype)
+
+    # prepare model
+    logger.info("Preparing model...")
+    upscaler: Upscaler = create_upscaler(weights=args.weights)
+    # logger.info("Loading weights from", args.weights)
+    # upscaler.load_state_dict(torch.load(args.weights))
+    upscaler.eval()
+    upscaler.to(DEVICE, dtype=us_dtype)
+
+    # load images
+    image_paths = glob.glob(args.image_pattern)
+    images = []
+    for image_path in image_paths:
+        image = Image.open(image_path)
+        image = image.convert("RGB")
+
+        # make divisible by 8
+        width = image.width
+        height = image.height
+        if width % 8 != 0:
+            width = width - (width % 8)
+        if height % 8 != 0:
+            height = height - (height % 8)
+        if width != image.width or height != image.height:
+            image = image.crop((0, 0, width, height))
+
+        images.append(image)
+
+    # debug output
+    if args.debug:
+        for image, image_path in zip(images, image_paths):
+            image_debug = image.resize((image.width * 2, image.height * 2), Image.LANCZOS)
+
+            basename = os.path.basename(image_path)
+            basename_wo_ext, ext = os.path.splitext(basename)
+            dest_file_name = os.path.join(args.output_dir, f"{basename_wo_ext}_lanczos4{ext}")
+            image_debug.save(dest_file_name)
+
+    # upscale
+    logger.info("Upscaling...")
+    upscaled_latents = upscaler.upscale(
+        vae, images, None, us_dtype, width * 2, height * 2, batch_size=args.batch_size, vae_batch_size=args.vae_batch_size
+    )
+    upscaled_latents /= 0.18215
+
+    # decode with batch
+    logger.info("Decoding...")
+    upscaled_images = []
+    for i in tqdm(range(0, upscaled_latents.shape[0], args.vae_batch_size)):
+        with torch.no_grad():
+            batch = vae.decode(upscaled_latents[i : i + args.vae_batch_size]).sample
+        batch = batch.to("cpu")
+        upscaled_images.append(batch)
+    upscaled_images = torch.cat(upscaled_images, dim=0)
+
+    # tensor to numpy
+    upscaled_images = upscaled_images.permute(0, 2, 3, 1).numpy()
+    upscaled_images = (upscaled_images + 1.0) * 127.5
+    upscaled_images = upscaled_images.clip(0, 255).astype(np.uint8)
+
+    upscaled_images = upscaled_images[..., ::-1]
+
+    # save images
+    for i, image in enumerate(upscaled_images):
+        basename = os.path.basename(image_paths[i])
+        basename_wo_ext, ext = os.path.splitext(basename)
+        dest_file_name = os.path.join(args.output_dir, f"{basename_wo_ext}_upscaled{ext}")
+        cv2.imwrite(dest_file_name, image)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--vae_path", type=str, default=None, help="VAE path")
+    parser.add_argument("--weights", type=str, default=None, help="Weights path")
+    parser.add_argument("--image_pattern", type=str, default=None, help="Image pattern")
+    parser.add_argument("--output_dir", type=str, default=".", help="Output directory")
+    parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
+    parser.add_argument("--vae_batch_size", type=int, default=1, help="VAE batch size")
+    parser.add_argument("--debug", action="store_true", help="Debug mode")
+
+    args = parser.parse_args()
+    upscale_images(args)
+
+
+tools\merge_models.py:
+import argparse
+import os
+
+import torch
+from safetensors import safe_open
+from safetensors.torch import load_file, save_file
+from tqdm import tqdm
+from library.utils import setup_logging
+setup_logging()
+import logging
+logger = logging.getLogger(__name__)
+
+def is_unet_key(key):
+    # VAE or TextEncoder, the last one is for SDXL
+    return not ("first_stage_model" in key or "cond_stage_model" in key or "conditioner." in key)
+
+
+TEXT_ENCODER_KEY_REPLACEMENTS = [
+    ("cond_stage_model.transformer.embeddings.", "cond_stage_model.transformer.text_model.embeddings."),
+    ("cond_stage_model.transformer.encoder.", "cond_stage_model.transformer.text_model.encoder."),
+    ("cond_stage_model.transformer.final_layer_norm.", "cond_stage_model.transformer.text_model.final_layer_norm."),
+]
+
+
+# support for models with different text encoder keys
+def replace_text_encoder_key(key):
+    for rep_from, rep_to in TEXT_ENCODER_KEY_REPLACEMENTS:
+        if key.startswith(rep_from):
+            return True, rep_to + key[len(rep_from) :]
+    return False, key
+
+
+def merge(args):
+    if args.precision == "fp16":
+        dtype = torch.float16
+    elif args.precision == "bf16":
+        dtype = torch.bfloat16
+    else:
+        dtype = torch.float
+
+    if args.saving_precision == "fp16":
+        save_dtype = torch.float16
+    elif args.saving_precision == "bf16":
+        save_dtype = torch.bfloat16
+    else:
+        save_dtype = torch.float
+
+    # check if all models are safetensors
+    for model in args.models:
+        if not model.endswith("safetensors"):
+            logger.info(f"Model {model} is not a safetensors model")
+            exit()
+        if not os.path.isfile(model):
+            logger.info(f"Model {model} does not exist")
+            exit()
+
+    assert args.ratios is None or len(args.models) == len(args.ratios), "ratios must be the same length as models"
+
+    # load and merge
+    ratio = 1.0 / len(args.models)  # default
+    supplementary_key_ratios = {}  # [key] = ratio, for keys not in all models, add later
+
+    merged_sd = None
+    first_model_keys = set()  # check missing keys in other models
+    for i, model in enumerate(args.models):
+        if args.ratios is not None:
+            ratio = args.ratios[i]
+
+        if merged_sd is None:
+            # load first model
+            logger.info(f"Loading model {model}, ratio = {ratio}...")
+            merged_sd = {}
+            with safe_open(model, framework="pt", device=args.device) as f:
+                for key in tqdm(f.keys()):
+                    value = f.get_tensor(key)
+                    _, key = replace_text_encoder_key(key)
+
+                    first_model_keys.add(key)
+
+                    if not is_unet_key(key) and args.unet_only:
+                        supplementary_key_ratios[key] = 1.0  # use first model's value for VAE or TextEncoder
+                        continue
+
+                    value = ratio * value.to(dtype)  # first model's value * ratio
+                    merged_sd[key] = value
+
+            logger.info(f"Model has {len(merged_sd)} keys " + ("(UNet only)" if args.unet_only else ""))
+            continue
+
+        # load other models
+        logger.info(f"Loading model {model}, ratio = {ratio}...")
+
+        with safe_open(model, framework="pt", device=args.device) as f:
+            model_keys = f.keys()
+            for key in tqdm(model_keys):
+                _, new_key = replace_text_encoder_key(key)
+                if new_key not in merged_sd:
+                    if args.show_skipped and new_key not in first_model_keys:
+                        logger.info(f"Skip: {new_key}")
+                    continue
+
+                value = f.get_tensor(key)
+                merged_sd[new_key] = merged_sd[new_key] + ratio * value.to(dtype)
+
+            # enumerate keys not in this model
+            model_keys = set(model_keys)
+            for key in merged_sd.keys():
+                if key in model_keys:
+                    continue
+                logger.warning(f"Key {key} not in model {model}, use first model's value")
+                if key in supplementary_key_ratios:
+                    supplementary_key_ratios[key] += ratio
+                else:
+                    supplementary_key_ratios[key] = ratio
+
+    # add supplementary keys' value (including VAE and TextEncoder)
+    if len(supplementary_key_ratios) > 0:
+        logger.info("add first model's value")
+        with safe_open(args.models[0], framework="pt", device=args.device) as f:
+            for key in tqdm(f.keys()):
+                _, new_key = replace_text_encoder_key(key)
+                if new_key not in supplementary_key_ratios:
+                    continue
+
+                if is_unet_key(new_key):  # not VAE or TextEncoder
+                    logger.warning(f"Key {new_key} not in all models, ratio = {supplementary_key_ratios[new_key]}")
+
+                value = f.get_tensor(key)  # original key
+
+                if new_key not in merged_sd:
+                    merged_sd[new_key] = supplementary_key_ratios[new_key] * value.to(dtype)
+                else:
+                    merged_sd[new_key] = merged_sd[new_key] + supplementary_key_ratios[new_key] * value.to(dtype)
+
+    # save
+    output_file = args.output
+    if not output_file.endswith(".safetensors"):
+        output_file = output_file + ".safetensors"
+
+    logger.info(f"Saving to {output_file}...")
+
+    # convert to save_dtype
+    for k in merged_sd.keys():
+        merged_sd[k] = merged_sd[k].to(save_dtype)
+
+    save_file(merged_sd, output_file)
+
+    logger.info("Done!")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Merge models")
+    parser.add_argument("--models", nargs="+", type=str, help="Models to merge")
+    parser.add_argument("--output", type=str, help="Output model")
+    parser.add_argument("--ratios", nargs="+", type=float, help="Ratios of models, default is equal, total = 1.0")
+    parser.add_argument("--unet_only", action="store_true", help="Only merge unet")
+    parser.add_argument("--device", type=str, default="cpu", help="Device to use, default is cpu")
+    parser.add_argument(
+        "--precision", type=str, default="float", choices=["float", "fp16", "bf16"], help="Calculation precision, default is float"
+    )
+    parser.add_argument(
+        "--saving_precision",
+        type=str,
+        default="float",
+        choices=["float", "fp16", "bf16"],
+        help="Saving precision, default is float",
+    )
+    parser.add_argument("--show_skipped", action="store_true", help="Show skipped keys (keys not in first model)")
+
+    args = parser.parse_args()
+    merge(args)
+
+

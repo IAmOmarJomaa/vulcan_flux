@@ -1,0 +1,1442 @@
+docs\train_db_README-zh.md:
+这是DreamBooth的指南。
+
+请同时查看[关于学习的通用文档](./train_README-zh.md)。
+
+# 概要
+
+DreamBooth是一种将特定主题添加到图像生成模型中进行学习，并使用特定识别子生成它的技术。论文链接。
+
+具体来说，它可以将角色和绘画风格等添加到Stable Diffusion模型中进行学习，并使用特定的单词（例如`shs`）来调用（呈现在生成的图像中）。
+
+脚本基于Diffusers的DreamBooth，但添加了以下功能（一些功能已在原始脚本中得到支持）。
+
+脚本的主要功能如下：
+
+- 使用8位Adam优化器和潜在变量的缓存来节省内存（与Shivam Shrirao版相似）。
+- 使用xformers来节省内存。
+- 不仅支持512x512，还支持任意尺寸的训练。
+- 通过数据增强来提高质量。
+- 支持DreamBooth和Text Encoder + U-Net的微调。
+- 支持以Stable Diffusion格式读写模型。
+- 支持Aspect Ratio Bucketing。
+- 支持Stable Diffusion v2.0。
+
+# 训练步骤
+
+请先参阅此存储库的README以进行环境设置。
+
+## 准备数据
+
+请参阅[有关准备训练数据的说明](./train_README-zh.md)。
+
+## 运行训练
+
+运行脚本。以下是最大程度地节省内存的命令（实际上，这将在一行中输入）。请根据需要修改每行。它似乎需要约12GB的VRAM才能运行。
+```
+accelerate launch --num_cpu_threads_per_process 1 train_db.py 
+    --pretrained_model_name_or_path=<.ckpt或.safetensord或Diffusers版模型的目录>
+    --dataset_config=<数据准备时创建的.toml文件>
+    --output_dir=<训练模型的输出目录>
+    --output_name=<训练模型输出时的文件名>
+    --save_model_as=safetensors 
+    --prior_loss_weight=1.0 
+    --max_train_steps=1600 
+    --learning_rate=1e-6 
+    --optimizer_type="AdamW8bit" 
+    --xformers 
+    --mixed_precision="fp16" 
+    --cache_latents 
+    --gradient_checkpointing
+```
+`num_cpu_threads_per_process` 通常应该设置为1。
+
+`pretrained_model_name_or_path` 指定要进行追加训练的基础模型。可以指定 Stable Diffusion 的 checkpoint 文件（.ckpt 或 .safetensors）、Diffusers 的本地模型目录或模型 ID（如 "stabilityai/stable-diffusion-2"）。
+
+`output_dir` 指定保存训练后模型的文件夹。在 `output_name` 中指定模型文件名，不包括扩展名。使用 `save_model_as` 指定以 safetensors 格式保存。
+
+在 `dataset_config` 中指定 `.toml` 文件。初始批处理大小应为 `1`，以减少内存消耗。
+
+`prior_loss_weight` 是正则化图像损失的权重。通常设为1.0。
+
+将要训练的步数 `max_train_steps` 设置为1600。在这里，学习率 `learning_rate` 被设置为1e-6。
+
+为了节省内存，设置 `mixed_precision="fp16"`（在 RTX30 系列及更高版本中也可以设置为 `bf16`）。同时指定 `gradient_checkpointing`。
+
+为了使用内存消耗较少的 8bit AdamW 优化器（将模型优化为适合于训练数据的状态），指定 `optimizer_type="AdamW8bit"`。
+
+指定 `xformers` 选项，并使用 xformers 的 CrossAttention。如果未安装 xformers 或出现错误（具体情况取决于环境，例如使用 `mixed_precision="no"`），则可以指定 `mem_eff_attn` 选项以使用省内存版的 CrossAttention（速度会变慢）。
+
+为了节省内存，指定 `cache_latents` 选项以缓存 VAE 的输出。
+
+如果有足够的内存，请编辑 `.toml` 文件将批处理大小增加到大约 `4`（可能会提高速度和精度）。此外，取消 `cache_latents` 选项可以进行数据增强。
+
+### 常用选项
+
+对于以下情况，请参阅“常用选项”部分。
+
+- 学习 Stable Diffusion 2.x 或其衍生模型。
+- 学习基于 clip skip 大于等于2的模型。
+- 学习超过75个令牌的标题。
+
+### 关于DreamBooth中的步数
+
+为了实现省内存化，该脚本中每个步骤的学习次数减半（因为学习和正则化的图像在训练时被分为不同的批次）。
+
+要进行与原始Diffusers版或XavierXiao的Stable Diffusion版几乎相同的学习，请将步骤数加倍。
+
+（虽然在将学习图像和正则化图像整合后再打乱顺序，但我认为对学习没有太大影响。）
+
+关于DreamBooth的批量大小
+
+与像LoRA这样的学习相比，为了训练整个模型，内存消耗量会更大（与微调相同）。
+
+关于学习率
+
+在Diffusers版中，学习率为5e-6，而在Stable Diffusion版中为1e-6，因此在上面的示例中指定了1e-6。
+
+当使用旧格式的数据集指定命令行时
+
+使用选项指定分辨率和批量大小。命令行示例如下。
+```
+accelerate launch --num_cpu_threads_per_process 1 train_db.py 
+    --pretrained_model_name_or_path=<.ckpt或.safetensord或Diffusers版模型的目录> 
+    --train_data_dir=<训练数据的目录> 
+    --reg_data_dir=<正则化图像的目录> 
+    --output_dir=<训练后模型的输出目录> 
+    --output_name=<训练后模型输出文件的名称>  
+    --prior_loss_weight=1.0 
+    --resolution=512 
+    --train_batch_size=1 
+    --learning_rate=1e-6 
+    --max_train_steps=1600 
+    --use_8bit_adam 
+    --xformers 
+    --mixed_precision="bf16" 
+    --cache_latents
+    --gradient_checkpointing
+```
+
+## 使用训练好的模型生成图像
+
+训练完成后，将在指定的文件夹中以指定的名称输出safetensors文件。
+
+对于v1.4/1.5和其他派生模型，可以在此模型中使用Automatic1111先生的WebUI进行推断。请将其放置在models\Stable-diffusion文件夹中。
+
+对于使用v2.x模型在WebUI中生成图像的情况，需要单独的.yaml文件来描述模型的规格。对于v2.x base，需要v2-inference.yaml，对于768/v，则需要v2-inference-v.yaml。请将它们放置在相同的文件夹中，并将文件扩展名之前的部分命名为与模型相同的名称。
+![image](https://user-images.githubusercontent.com/52813779/210776915-061d79c3-6582-42c2-8884-8b91d2f07313.png)
+
+每个yaml文件都在[Stability AI的SD2.0存储库](https://github.com/Stability-AI/stablediffusion/tree/main/configs/stable-diffusion)……之中。
+
+# DreamBooth的其他主要选项
+
+有关所有选项的详细信息，请参阅另一份文档。
+
+## 不在中途开始对文本编码器进行训练 --stop_text_encoder_training
+
+如果在stop_text_encoder_training选项中指定一个数字，则在该步骤之后，将不再对文本编码器进行训练，只会对U-Net进行训练。在某些情况下，可能会期望提高精度。
+
+（我们推测可能会有时候仅仅文本编码器会过度学习，而这样做可以避免这种情况，但详细影响尚不清楚。）
+
+## 不进行分词器的填充 --no_token_padding
+
+如果指定no_token_padding选项，则不会对分词器的输出进行填充（与Diffusers版本的旧DreamBooth相同）。
+
+<!-- 
+如果使用分桶（bucketing）和数据增强（augmentation），则使用示例如下：
+```
+accelerate launch --num_cpu_threads_per_process 8 train_db.py 
+    --pretrained_model_name_or_path=<.ckpt或.safetensord或Diffusers版模型的目录> 
+    --train_data_dir=<训练数据的目录> 
+    --reg_data_dir=<正则化图像的目录> 
+    --output_dir=<训练后模型的输出目录>
+    --resolution=768,512 
+    --train_batch_size=20 --learning_rate=5e-6 --max_train_steps=800 
+    --use_8bit_adam --xformers --mixed_precision="bf16" 
+    --save_every_n_epochs=1 --save_state --save_precision="bf16" 
+    --logging_dir=logs 
+    --enable_bucket --min_bucket_reso=384 --max_bucket_reso=1280 
+    --color_aug --flip_aug --gradient_checkpointing --seed 42
+```
+
+
+-->
+
+
+docs\train_lllite_README-ja.md:
+# ControlNet-LLLite について
+
+__きわめて実験的な実装のため、将来的に大きく変更される可能性があります。__
+
+## 概要
+ControlNet-LLLite は、[ControlNet](https://github.com/lllyasviel/ControlNet) の軽量版です。LoRA Like Lite という意味で、LoRAからインスピレーションを得た構造を持つ、軽量なControlNetです。現在はSDXLにのみ対応しています。
+
+## サンプルの重みファイルと推論
+
+こちらにあります: https://huggingface.co/kohya-ss/controlnet-lllite
+
+ComfyUIのカスタムノードを用意しています。: https://github.com/kohya-ss/ControlNet-LLLite-ComfyUI
+
+生成サンプルはこのページの末尾にあります。
+
+## モデル構造
+ひとつのLLLiteモジュールは、制御用画像（以下conditioning image）を潜在空間に写像するconditioning image embeddingと、LoRAにちょっと似た構造を持つ小型のネットワークからなります。LLLiteモジュールを、LoRAと同様にU-NetのLinearやConvに追加します。詳しくはソースコードを参照してください。
+
+推論環境の制限で、現在はCrossAttentionのみ（attn1のq/k/v、attn2のq）に追加されます。
+
+## モデルの学習
+
+### データセットの準備
+DreamBooth 方式の dataset で、`conditioning_data_dir` で指定したディレクトリにconditioning imageを格納してください。
+
+（finetuning 方式の dataset はサポートしていません。）
+
+conditioning imageは学習用画像と同じbasenameを持つ必要があります。また、conditioning imageは学習用画像と同じサイズに自動的にリサイズされます。conditioning imageにはキャプションファイルは不要です。
+
+たとえば、キャプションにフォルダ名ではなくキャプションファイルを用いる場合の設定ファイルは以下のようになります。
+
+```toml
+[[datasets.subsets]]
+image_dir = "path/to/image/dir"
+caption_extension = ".txt"
+conditioning_data_dir = "path/to/conditioning/image/dir"
+```
+
+現時点の制約として、random_cropは使用できません。
+
+学習データとしては、元のモデルで生成した画像を学習用画像として、そこから加工した画像をconditioning imageとした、合成によるデータセットを用いるのがもっとも簡単です（データセットの品質的には問題があるかもしれません）。具体的なデータセットの合成方法については後述します。
+
+なお、元モデルと異なる画風の画像を学習用画像とすると、制御に加えて、その画風についても学ぶ必要が生じます。ControlNet-LLLiteは容量が少ないため、画風学習には不向きです。このような場合には、後述の次元数を多めにしてください。
+
+### 学習
+スクリプトで生成する場合は、`sdxl_train_control_net_lllite.py` を実行してください。`--cond_emb_dim` でconditioning image embeddingの次元数を指定できます。`--network_dim` でLoRA的モジュールのrankを指定できます。その他のオプションは`sdxl_train_network.py`に準じますが、`--network_module`の指定は不要です。
+
+学習時にはメモリを大量に使用しますので、キャッシュやgradient checkpointingなどの省メモリ化のオプションを有効にしてください。また`--full_bf16` オプションで、BFloat16を使用するのも有効です（RTX 30シリーズ以降のGPUが必要です）。24GB VRAMで動作確認しています。
+
+conditioning image embeddingの次元数は、サンプルのCannyでは32を指定しています。LoRA的モジュールのrankは同じく64です。対象とするconditioning imageの特徴に合わせて調整してください。
+
+（サンプルのCannyは恐らくかなり難しいと思われます。depthなどでは半分程度にしてもいいかもしれません。）
+
+以下は .toml の設定例です。
+
+```toml
+pretrained_model_name_or_path = "/path/to/model_trained_on.safetensors"
+max_train_epochs = 12
+max_data_loader_n_workers = 4
+persistent_data_loader_workers = true
+seed = 42
+gradient_checkpointing = true
+mixed_precision = "bf16"
+save_precision = "bf16"
+full_bf16 = true
+optimizer_type = "adamw8bit"
+learning_rate = 2e-4
+xformers = true
+output_dir = "/path/to/output/dir"
+output_name = "output_name"
+save_every_n_epochs = 1
+save_model_as = "safetensors"
+vae_batch_size = 4
+cache_latents = true
+cache_latents_to_disk = true
+cache_text_encoder_outputs = true
+cache_text_encoder_outputs_to_disk = true
+network_dim = 64
+cond_emb_dim = 32
+dataset_config = "/path/to/dataset.toml"
+```
+
+### 推論
+
+スクリプトで生成する場合は、`sdxl_gen_img.py` を実行してください。`--control_net_lllite_models` でLLLiteのモデルファイルを指定できます。次元数はモデルファイルから自動取得します。
+
+`--guide_image_path`で推論に用いるconditioning imageを指定してください。なおpreprocessは行われないため、たとえばCannyならCanny処理を行った画像を指定してください（背景黒に白線）。`--control_net_preps`, `--control_net_weights`, `--control_net_ratios` には未対応です。
+
+## データセットの合成方法
+
+### 学習用画像の生成
+
+学習のベースとなるモデルで画像生成を行います。Web UIやComfyUIなどで生成してください。画像サイズはモデルのデフォルトサイズで良いと思われます（1024x1024など）。bucketingを用いることもできます。その場合は適宜適切な解像度で生成してください。
+
+生成時のキャプション等は、ControlNet-LLLiteの利用時に生成したい画像にあわせるのが良いと思われます。
+
+生成した画像を任意のディレクトリに保存してください。このディレクトリをデータセットの設定ファイルで指定します。
+
+当リポジトリ内の `sdxl_gen_img.py` でも生成できます。例えば以下のように実行します。
+
+```dos
+python sdxl_gen_img.py --ckpt path/to/model.safetensors --n_iter 1 --scale 10 --steps 36 --outdir path/to/output/dir --xformers --W 1024 --H 1024 --original_width 2048 --original_height 2048 --bf16 --sampler ddim --batch_size 4 --vae_batch_size 2 --images_per_prompt 512 --max_embeddings_multiples 1 --prompt "{portrait|digital art|anime screen cap|detailed illustration} of 1girl, {standing|sitting|walking|running|dancing} on {classroom|street|town|beach|indoors|outdoors}, {looking at viewer|looking away|looking at another}, {in|wearing} {shirt and skirt|school uniform|casual wear} { |, dynamic pose}, (solo), teen age, {0-1$$smile,|blush,|kind smile,|expression less,|happy,|sadness,} {0-1$$upper body,|full body,|cowboy shot,|face focus,} trending on pixiv, {0-2$$depth of fields,|8k wallpaper,|highly detailed,|pov,} {0-1$$summer, |winter, |spring, |autumn, } beautiful face { |, from below|, from above|, from side|, from behind|, from back} --n nsfw, bad face, lowres, low quality, worst quality, low effort, watermark, signature, ugly, poorly drawn"
+```
+
+VRAM 24GBの設定です。VRAMサイズにより`--batch_size` `--vae_batch_size`を調整してください。
+
+`--prompt`でワイルドカードを利用してランダムに生成しています。適宜調整してください。
+
+### 画像の加工
+
+外部のプログラムを用いて、生成した画像を加工します。加工した画像を任意のディレクトリに保存してください。これらがconditioning imageになります。
+
+加工にはたとえばCannyなら以下のようなスクリプトが使えます。
+
+```python
+import glob
+import os
+import random
+import cv2
+import numpy as np
+
+IMAGES_DIR = "path/to/generated/images"
+CANNY_DIR = "path/to/canny/images"
+
+os.makedirs(CANNY_DIR, exist_ok=True)
+img_files = glob.glob(IMAGES_DIR + "/*.png")
+for img_file in img_files:
+    can_file = CANNY_DIR + "/" + os.path.basename(img_file)
+    if os.path.exists(can_file):
+        print("Skip: " + img_file)
+        continue
+
+    print(img_file)
+
+    img = cv2.imread(img_file)
+
+    # random threshold
+    # while True:
+    #     threshold1 = random.randint(0, 127)
+    #     threshold2 = random.randint(128, 255)
+    #     if threshold2 - threshold1 > 80:
+    #         break
+
+    # fixed threshold
+    threshold1 = 100
+    threshold2 = 200
+
+    img = cv2.Canny(img, threshold1, threshold2)
+
+    cv2.imwrite(can_file, img)
+```
+
+### キャプションファイルの作成
+
+学習用画像のbasenameと同じ名前で、それぞれの画像に対応したキャプションファイルを作成してください。生成時のプロンプトをそのまま利用すれば良いと思われます。
+
+`sdxl_gen_img.py` で生成した場合は、画像内のメタデータに生成時のプロンプトが記録されていますので、以下のようなスクリプトで学習用画像と同じディレクトリにキャプションファイルを作成できます（拡張子 `.txt`）。
+
+```python
+import glob
+import os
+from PIL import Image
+
+IMAGES_DIR = "path/to/generated/images"
+
+img_files = glob.glob(IMAGES_DIR + "/*.png")
+for img_file in img_files:
+    cap_file = img_file.replace(".png", ".txt")
+    if os.path.exists(cap_file):
+        print(f"Skip: {img_file}")
+        continue
+    print(img_file)
+
+    img = Image.open(img_file)
+    prompt = img.text["prompt"] if "prompt" in img.text else ""
+    if prompt == "":
+        print(f"Prompt not found in {img_file}")
+
+    with open(cap_file, "w") as f:
+        f.write(prompt + "\n")
+```
+
+### データセットの設定ファイルの作成
+
+コマンドラインオプションからの指定も可能ですが、`.toml`ファイルを作成する場合は `conditioning_data_dir` に加工した画像を保存したディレクトリを指定します。
+
+以下は設定ファイルの例です。
+
+```toml
+[general]
+flip_aug = false
+color_aug = false
+resolution = [1024,1024]
+
+[[datasets]]
+batch_size = 8
+enable_bucket = false
+
+    [[datasets.subsets]]
+    image_dir = "path/to/generated/image/dir"
+    caption_extension = ".txt"
+    conditioning_data_dir = "path/to/canny/image/dir"
+```
+
+## 謝辞
+
+ControlNetの作者である lllyasviel 氏、実装上のアドバイスとトラブル解決へのご尽力をいただいた furusu 氏、ControlNetデータセットを実装していただいた ddPn08 氏に感謝いたします。
+
+## サンプル
+Canny
+![kohya_ss_girl_standing_at_classroom_smiling_to_the_viewer_class_78976b3e-0d4d-4ea0-b8e3-053ae493abbc](https://github.com/kohya-ss/sd-scripts/assets/52813779/37e9a736-649b-4c0f-ab26-880a1bf319b5)
+
+![im_20230820104253_000_1](https://github.com/kohya-ss/sd-scripts/assets/52813779/c8896900-ab86-4120-932f-6e2ae17b77c0)
+
+![im_20230820104302_000_1](https://github.com/kohya-ss/sd-scripts/assets/52813779/b12457a0-ee3c-450e-ba9a-b712d0fe86bb)
+
+![im_20230820104310_000_1](https://github.com/kohya-ss/sd-scripts/assets/52813779/8845b8d9-804a-44ac-9618-113a28eac8a1)
+
+
+
+docs\train_lllite_README.md:
+# About ControlNet-LLLite
+
+__This is an extremely experimental implementation and may change significantly in the future.__
+
+日本語版は[こちら](./train_lllite_README-ja.md)
+
+## Overview
+
+ControlNet-LLLite is a lightweight version of [ControlNet](https://github.com/lllyasviel/ControlNet). It is a "LoRA Like Lite" that is inspired by LoRA and has a lightweight structure. Currently, only SDXL is supported.
+
+## Sample weight file and inference
+
+Sample weight file is available here: https://huggingface.co/kohya-ss/controlnet-lllite
+
+A custom node for ComfyUI is available: https://github.com/kohya-ss/ControlNet-LLLite-ComfyUI
+
+Sample images are at the end of this page.
+
+## Model structure
+
+A single LLLite module consists of a conditioning image embedding that maps a conditioning image to a latent space and a small network with a structure similar to LoRA. The LLLite module is added to U-Net's Linear and Conv in the same way as LoRA. Please refer to the source code for details.
+
+Due to the limitations of the inference environment, only CrossAttention (attn1 q/k/v, attn2 q) is currently added.
+
+## Model training
+
+### Preparing the dataset
+
+In addition to the normal DreamBooth method dataset, please store the conditioning image in the directory specified by `conditioning_data_dir`. The conditioning image must have the same basename as the training image. The conditioning image will be automatically resized to the same size as the training image. The conditioning image does not require a caption file.
+
+(We do not support the finetuning method dataset.)
+
+```toml
+[[datasets.subsets]]
+image_dir = "path/to/image/dir"
+caption_extension = ".txt"
+conditioning_data_dir = "path/to/conditioning/image/dir"
+```
+
+At the moment, random_crop cannot be used.
+
+For training data, it is easiest to use a synthetic dataset with the original model-generated images as training images and processed images as conditioning images (the quality of the dataset may be problematic). See below for specific methods of synthesizing datasets.
+
+Note that if you use an image with a different art style than the original model as a training image, the model will have to learn not only the control but also the art style. ControlNet-LLLite has a small capacity, so it is not suitable for learning art styles. In such cases, increase the number of dimensions as described below.
+
+### Training
+
+Run `sdxl_train_control_net_lllite.py`. You can specify the dimension of the conditioning image embedding with `--cond_emb_dim`. You can specify the rank of the LoRA-like module with `--network_dim`. Other options are the same as `sdxl_train_network.py`, but `--network_module` is not required.
+
+Since a large amount of memory is used during training, please enable memory-saving options such as cache and gradient checkpointing. It is also effective to use BFloat16 with the `--full_bf16` option (requires RTX 30 series or later GPU). It has been confirmed to work with 24GB VRAM.
+
+For the sample Canny, the dimension of the conditioning image embedding is 32. The rank of the LoRA-like module is also 64. Adjust according to the features of the conditioning image you are targeting.
+
+(The sample Canny is probably quite difficult. It may be better to reduce it to about half for depth, etc.)
+
+The following is an example of a .toml configuration.
+
+```toml
+pretrained_model_name_or_path = "/path/to/model_trained_on.safetensors"
+max_train_epochs = 12
+max_data_loader_n_workers = 4
+persistent_data_loader_workers = true
+seed = 42
+gradient_checkpointing = true
+mixed_precision = "bf16"
+save_precision = "bf16"
+full_bf16 = true
+optimizer_type = "adamw8bit"
+learning_rate = 2e-4
+xformers = true
+output_dir = "/path/to/output/dir"
+output_name = "output_name"
+save_every_n_epochs = 1
+save_model_as = "safetensors"
+vae_batch_size = 4
+cache_latents = true
+cache_latents_to_disk = true
+cache_text_encoder_outputs = true
+cache_text_encoder_outputs_to_disk = true
+network_dim = 64
+cond_emb_dim = 32
+dataset_config = "/path/to/dataset.toml"
+```
+
+### Inference
+
+If you want to generate images with a script, run `sdxl_gen_img.py`. You can specify the LLLite model file with `--control_net_lllite_models`. The dimension is automatically obtained from the model file.
+
+Specify the conditioning image to be used for inference with `--guide_image_path`. Since preprocess is not performed, if it is Canny, specify an image processed with Canny (white line on black background). `--control_net_preps`, `--control_net_weights`, and `--control_net_ratios` are not supported.
+
+## How to synthesize a dataset
+
+### Generating training images
+
+Generate images with the base model for training. Please generate them with Web UI or ComfyUI etc. The image size should be the default size of the model (1024x1024, etc.). You can also use bucketing. In that case, please generate it at an arbitrary resolution.
+
+The captions and other settings when generating the images should be the same as when generating the images with the trained ControlNet-LLLite model.
+
+Save the generated images in an arbitrary directory. Specify this directory in the dataset configuration file.
+
+
+You can also generate them with `sdxl_gen_img.py` in this repository. For example, run as follows:
+
+```dos
+python sdxl_gen_img.py --ckpt path/to/model.safetensors --n_iter 1 --scale 10 --steps 36 --outdir path/to/output/dir --xformers --W 1024 --H 1024 --original_width 2048 --original_height 2048 --bf16 --sampler ddim --batch_size 4 --vae_batch_size 2 --images_per_prompt 512 --max_embeddings_multiples 1 --prompt "{portrait|digital art|anime screen cap|detailed illustration} of 1girl, {standing|sitting|walking|running|dancing} on {classroom|street|town|beach|indoors|outdoors}, {looking at viewer|looking away|looking at another}, {in|wearing} {shirt and skirt|school uniform|casual wear} { |, dynamic pose}, (solo), teen age, {0-1$$smile,|blush,|kind smile,|expression less,|happy,|sadness,} {0-1$$upper body,|full body,|cowboy shot,|face focus,} trending on pixiv, {0-2$$depth of fields,|8k wallpaper,|highly detailed,|pov,} {0-1$$summer, |winter, |spring, |autumn, } beautiful face { |, from below|, from above|, from side|, from behind|, from back} --n nsfw, bad face, lowres, low quality, worst quality, low effort, watermark, signature, ugly, poorly drawn"
+```
+
+This is a setting for VRAM 24GB. Adjust `--batch_size` and `--vae_batch_size` according to the VRAM size.
+
+The images are generated randomly using wildcards in `--prompt`. Adjust as necessary.
+
+### Processing images
+
+Use an external program to process the generated images. Save the processed images in an arbitrary directory. These will be the conditioning images.
+
+For example, you can use the following script to process the images with Canny.
+
+```python
+import glob
+import os
+import random
+import cv2
+import numpy as np
+
+IMAGES_DIR = "path/to/generated/images"
+CANNY_DIR = "path/to/canny/images"
+
+os.makedirs(CANNY_DIR, exist_ok=True)
+img_files = glob.glob(IMAGES_DIR + "/*.png")
+for img_file in img_files:
+    can_file = CANNY_DIR + "/" + os.path.basename(img_file)
+    if os.path.exists(can_file):
+        print("Skip: " + img_file)
+        continue
+
+    print(img_file)
+
+    img = cv2.imread(img_file)
+
+    # random threshold
+    # while True:
+    #     threshold1 = random.randint(0, 127)
+    #     threshold2 = random.randint(128, 255)
+    #     if threshold2 - threshold1 > 80:
+    #         break
+
+    # fixed threshold
+    threshold1 = 100
+    threshold2 = 200
+
+    img = cv2.Canny(img, threshold1, threshold2)
+
+    cv2.imwrite(can_file, img)
+```
+
+### Creating caption files
+
+Create a caption file for each image with the same basename as the training image. It is fine to use the same caption as the one used when generating the image. 
+
+If you generated the images with `sdxl_gen_img.py`, you can use the following script to create the caption files (`*.txt`) from the metadata in the generated images.
+
+```python
+import glob
+import os
+from PIL import Image
+
+IMAGES_DIR = "path/to/generated/images"
+
+img_files = glob.glob(IMAGES_DIR + "/*.png")
+for img_file in img_files:
+    cap_file = img_file.replace(".png", ".txt")
+    if os.path.exists(cap_file):
+        print(f"Skip: {img_file}")
+        continue
+    print(img_file)
+
+    img = Image.open(img_file)
+    prompt = img.text["prompt"] if "prompt" in img.text else ""
+    if prompt == "":
+        print(f"Prompt not found in {img_file}")
+
+    with open(cap_file, "w") as f:
+        f.write(prompt + "\n")
+```
+
+### Creating a dataset configuration file
+
+You can use the command line argument `--conditioning_data_dir` of `sdxl_train_control_net_lllite.py` to specify the conditioning image directory. However, if you want to use a `.toml` file, specify the conditioning image directory in `conditioning_data_dir`.
+
+```toml
+[general]
+flip_aug = false
+color_aug = false
+resolution = [1024,1024]
+
+[[datasets]]
+batch_size = 8
+enable_bucket = false
+
+    [[datasets.subsets]]
+    image_dir = "path/to/generated/image/dir"
+    caption_extension = ".txt"
+    conditioning_data_dir = "path/to/canny/image/dir"
+```
+
+## Credit
+
+I would like to thank lllyasviel, the author of ControlNet, furusu, who provided me with advice on implementation and helped me solve problems, and ddPn08, who implemented the ControlNet dataset.
+
+## Sample
+
+Canny
+![kohya_ss_girl_standing_at_classroom_smiling_to_the_viewer_class_78976b3e-0d4d-4ea0-b8e3-053ae493abbc](https://github.com/kohya-ss/sd-scripts/assets/52813779/37e9a736-649b-4c0f-ab26-880a1bf319b5)
+
+![im_20230820104253_000_1](https://github.com/kohya-ss/sd-scripts/assets/52813779/c8896900-ab86-4120-932f-6e2ae17b77c0)
+
+![im_20230820104302_000_1](https://github.com/kohya-ss/sd-scripts/assets/52813779/b12457a0-ee3c-450e-ba9a-b712d0fe86bb)
+
+![im_20230820104310_000_1](https://github.com/kohya-ss/sd-scripts/assets/52813779/8845b8d9-804a-44ac-9618-113a28eac8a1)
+
+
+docs\train_network.md:
+# How to use the LoRA training script `train_network.py` / LoRA学習スクリプト `train_network.py` の使い方
+
+This document explains the basic procedures for training LoRA (Low-Rank Adaptation) models using `train_network.py` included in the `sd-scripts` repository.
+
+<details>
+<summary>日本語</summary>
+このドキュメントでは、`sd-scripts` リポジトリに含まれる `train_network.py` を使用して LoRA (Low-Rank Adaptation) モデルを学習する基本的な手順について解説します。
+</details>
+
+## 1. Introduction / はじめに
+
+`train_network.py` is a script for training additional networks such as LoRA on Stable Diffusion models (v1.x, v2.x). It allows for additional training on the original model with a low computational cost, enabling the creation of models that reproduce specific characters or art styles.
+
+This guide focuses on LoRA training and explains the basic configuration items.
+
+**Prerequisites:**
+
+* The `sd-scripts` repository has been cloned and the Python environment has been set up.
+* The training dataset has been prepared. (For dataset preparation, please refer to [this guide](link/to/dataset/doc))
+
+<details>
+<summary>日本語</summary>
+
+`train_network.py` は、Stable Diffusion モデル（v1.x, v2.x）に対して、LoRA などの追加ネットワークを学習させるためのスクリプトです。少ない計算コストで元のモデルに追加学習を行い、特定のキャラクターや画風を再現するモデルを作成できます。
+
+このガイドでは、LoRA 学習に焦点を当て、基本的な設定項目を中心に説明します。
+
+**前提条件:**
+
+*   `sd-scripts` リポジトリのクローンと Python 環境のセットアップが完了していること。
+*   学習用データセットの準備が完了していること。（データセットの準備については[こちら](link/to/dataset/doc)を参照してください）
+</details>
+
+## 2. Preparation / 準備
+
+Before starting training, you will need the following files:
+
+1. **Training script:** `train_network.py`
+2. **Dataset definition file (.toml):** A file in TOML format that describes the configuration of the training dataset.
+
+### About the Dataset Definition File / データセット定義ファイルについて
+
+The dataset definition file (`.toml`) contains detailed settings such as the directory of images to use, repetition count, caption settings, resolution buckets (optional), etc.
+
+For more details on how to write the dataset definition file, please refer to the [Dataset Configuration Guide](link/to/dataset/config/doc).
+
+In this guide, we will use a file named `my_dataset_config.toml` as an example.
+
+<details>
+<summary>日本語</summary>
+
+学習を開始する前に、以下のファイルが必要です。
+
+1.  **学習スクリプト:** `train_network.py`
+2.  **データセット定義ファイル (.toml):** 学習データセットの設定を記述した TOML 形式のファイル。
+
+**データセット定義ファイルについて**
+
+データセット定義ファイル (`.toml`) には、使用する画像のディレクトリ、繰り返し回数、キャプションの設定、解像度バケツ（任意）などの詳細な設定を記述します。
+
+データセット定義ファイルの詳しい書き方については、[データセット設定ガイド](link/to/dataset/config/doc)を参照してください。
+
+ここでは、例として `my_dataset_config.toml` という名前のファイルを使用することにします。
+</details>
+
+## 3. Running the Training / 学習の実行
+
+Training is started by executing `train_network.py` from the terminal. When executing, various training settings are specified as command-line arguments.
+
+Below is a basic command-line execution example:
+
+```bash
+accelerate launch --num_cpu_threads_per_process 1 train_network.py 
+ --pretrained_model_name_or_path="<path to Stable Diffusion model>" 
+ --dataset_config="my_dataset_config.toml" 
+ --output_dir="<output directory for training results>" 
+ --output_name="my_lora" 
+ --save_model_as=safetensors 
+ --network_module=networks.lora 
+ --network_dim=16 
+ --network_alpha=1 
+ --learning_rate=1e-4 
+ --optimizer_type="AdamW8bit" 
+ --lr_scheduler="constant" 
+ --sdpa  
+ --max_train_epochs=10 
+ --save_every_n_epochs=1 
+ --mixed_precision="fp16" 
+ --gradient_checkpointing 
+```
+
+In reality, you need to write this in a single line, but it's shown with line breaks for readability (on Linux or Mac, you can add `\` at the end of each line to break lines). For Windows, either write it in a single line without breaks or add `^` at the end of each line.
+
+Next, we'll explain the main command-line arguments.
+
+<details>
+<summary>日本語</summary>
+
+学習は、ターミナルから `train_network.py` を実行することで開始します。実行時には、学習に関する様々な設定をコマンドライン引数として指定します。
+
+以下に、基本的なコマンドライン実行例を示します。
+
+実際には1行で書く必要がありますが、見やすさのために改行しています（Linux や Mac では `\` を行末に追加することで改行できます）。Windows の場合は、改行せずに1行で書くか、`^` を行末に追加してください。
+
+次に、主要なコマンドライン引数について解説します。
+</details>
+
+### 3.1. Main Command-Line Arguments / 主要なコマンドライン引数
+
+#### Model Related / モデル関連
+
+* `--pretrained_model_name_or_path="<path to model>"` **[Required]**
+  * Specifies the Stable Diffusion model to be used as the base for training. You can specify the path to a local `.ckpt` or `.safetensors` file, or a directory containing a Diffusers format model. You can also specify a Hugging Face Hub model ID (e.g., `"stabilityai/stable-diffusion-2-1-base"`).
+* `--v2`
+  * Specify this when the base model is Stable Diffusion v2.x.
+* `--v_parameterization`
+  * Specify this when training with a v-prediction model (such as v2.x 768px models).
+
+#### Dataset Related / データセット関連
+
+* `--dataset_config="<path to configuration file>"`
+  * Specifies the path to a `.toml` file describing the dataset configuration. (For details on dataset configuration, see [here](link/to/dataset/config/doc))
+  * It's also possible to specify dataset settings from the command line, but using a `.toml` file is recommended as it becomes lengthy.
+
+#### Output and Save Related / 出力・保存関連
+
+* `--output_dir="<output directory>"` **[Required]**
+  * Specifies the directory where trained LoRA models, sample images, logs, etc. will be output.
+* `--output_name="<output filename>"` **[Required]**
+  * Specifies the filename of the trained LoRA model (excluding the extension).
+* `--save_model_as="safetensors"`
+  * Specifies the format for saving the model. You can choose from `safetensors` (recommended), `ckpt`, or `pt`. The default is `safetensors`.
+* `--save_every_n_epochs=1`
+  * Saves the model every specified number of epochs. If not specified, only the final model will be saved.
+* `--save_every_n_steps=1000`
+  * Saves the model every specified number of steps. If both epoch and step saving are specified, both will be saved.
+
+#### LoRA Parameters / LoRA パラメータ
+
+* `--network_module=networks.lora` **[Required]**
+  * Specifies the type of network to train. For LoRA, specify `networks.lora`.
+* `--network_dim=16` **[Required]**
+  * Specifies the rank (dimension) of LoRA. Higher values increase expressiveness but also increase file size and computational cost. Values between 4 and 128 are commonly used. There is no default (module dependent).
+* `--network_alpha=1`
+  * Specifies the alpha value for LoRA. This parameter is related to learning rate scaling. It is generally recommended to set it to about half the value of `network_dim`, but it can also be the same value as `network_dim`. The default is 1. Setting it to the same value as `network_dim` will result in behavior similar to older versions.
+
+#### Training Parameters / 学習パラメータ
+
+* `--learning_rate=1e-4`
+  * Specifies the learning rate. For LoRA training (when alpha value is 1), relatively higher values (e.g., from `1e-4` to `1e-3`) are often used.
+* `--unet_lr=1e-4`
+  * Used to specify a separate learning rate for the LoRA modules in the U-Net part. If not specified, the value of `--learning_rate` is used.
+* `--text_encoder_lr=1e-5`
+  * Used to specify a separate learning rate for the LoRA modules in the Text Encoder part. If not specified, the value of `--learning_rate` is used. A smaller value than that for U-Net is recommended.
+* `--optimizer_type="AdamW8bit"`
+  * Specifies the optimizer to use for training. Options include `AdamW8bit` (requires `bitsandbytes`), `AdamW`, `Lion` (requires `lion-pytorch`), `DAdaptation` (requires `dadaptation`), and `Adafactor`. `AdamW8bit` is memory-efficient and widely used.
+* `--lr_scheduler="constant"`
+  * Specifies the learning rate scheduler. This is the method for changing the learning rate as training progresses. Options include `constant` (no change), `cosine` (cosine curve), `linear` (linear decay), `constant_with_warmup` (constant with warmup), and `cosine_with_restarts`. `constant`, `cosine`, and `constant_with_warmup` are commonly used.
+* `--lr_warmup_steps=500`
+  * Specifies the number of warmup steps for the learning rate scheduler. This is the period during which the learning rate gradually increases at the start of training. Valid when the `lr_scheduler` supports warmup.
+* `--max_train_steps=10000`
+  * Specifies the total number of training steps. If `max_train_epochs` is specified, that takes precedence.
+* `--max_train_epochs=12`
+  * Specifies the number of training epochs. If this is specified, `max_train_steps` is ignored.
+* `--sdpa`
+  * Uses Scaled Dot-Product Attention. This can reduce memory usage and improve training speed for LoRA training.
+* `--mixed_precision="fp16"`
+  * Specifies the mixed precision training setting. Options are `no` (disabled), `fp16` (half precision), and `bf16` (bfloat16). If your GPU supports it, specifying `fp16` or `bf16` can improve training speed and reduce memory usage.
+* `--gradient_accumulation_steps=1`
+  * Specifies the number of steps to accumulate gradients. This effectively increases the batch size to `train_batch_size * gradient_accumulation_steps`. Set a larger value if GPU memory is insufficient. Usually `1` is fine.
+
+#### Others / その他
+
+* `--seed=42`
+  * Specifies the random seed. Set this if you want to ensure reproducibility of the training.
+* `--logging_dir="<log directory>"`
+  * Specifies the directory to output logs for TensorBoard, etc. If not specified, logs will not be output.
+* `--log_prefix="<prefix>"`
+  * Specifies the prefix for the subdirectory name created within `logging_dir`.
+* `--gradient_checkpointing`
+  * Enables Gradient Checkpointing. This can significantly reduce memory usage but slightly decreases training speed. Useful when memory is limited.
+* `--clip_skip=1`
+  * Specifies how many layers to skip from the last layer of the Text Encoder. Specifying `2` will use the output from the second-to-last layer. `None` or `1` means no skip (uses the last layer). Check the recommended value for the model you are training.
+
+<details>
+<summary>日本語</summary>
+
+#### モデル関連
+
+*   `--pretrained_model_name_or_path="<モデルのパス>"` **[必須]**
+    *   学習のベースとなる Stable Diffusion モデルを指定します。ローカルの `.ckpt` または `.safetensors` ファイルのパス、あるいは Diffusers 形式モデルのディレクトリを指定できます。Hugging Face Hub のモデル ID (例: `"stabilityai/stable-diffusion-2-1-base"`) も指定可能です。
+*   `--v2`
+    *   ベースモデルが Stable Diffusion v2.x の場合に指定します。
+*   `--v_parameterization`
+    *   v-prediction モデル（v2.x の 768px モデルなど）で学習する場合に指定します。
+
+#### データセット関連
+
+*   `--dataset_config="<設定ファイルのパス>"` 
+    *   データセット設定を記述した `.toml` ファイルのパスを指定します。（データセット設定の詳細は[こちら](link/to/dataset/config/doc)）
+    *   コマンドラインからデータセット設定を指定することも可能ですが、長くなるため `.toml` ファイルを使用することを推奨します。
+
+#### 出力・保存関連
+
+*   `--output_dir="<出力先ディレクトリ>"` **[必須]**
+    *   学習済み LoRA モデルやサンプル画像、ログなどが出力されるディレクトリを指定します。
+*   `--output_name="<出力ファイル名>"` **[必須]**
+    *   学習済み LoRA モデルのファイル名（拡張子を除く）を指定します。
+*   `--save_model_as="safetensors"`
+    *   モデルの保存形式を指定します。`safetensors` (推奨), `ckpt`, `pt` から選択できます。デフォルトは `safetensors` です。
+*   `--save_every_n_epochs=1`
+    *   指定したエポックごとにモデルを保存します。省略するとエポックごとの保存は行われません（最終モデルのみ保存）。
+*   `--save_every_n_steps=1000`
+    *   指定したステップごとにモデルを保存します。エポック指定 (`save_every_n_epochs`) と同時に指定された場合、両方とも保存されます。
+
+#### LoRA パラメータ
+
+*   `--network_module=networks.lora` **[必須]**
+    *   学習するネットワークの種別を指定します。LoRA の場合は `networks.lora` を指定します。
+*   `--network_dim=16` **[必須]**
+    *   LoRA のランク (rank / 次元数) を指定します。値が大きいほど表現力は増しますが、ファイルサイズと計算コストが増加します。一般的には 4〜128 程度の値が使われます。デフォルトは指定されていません（モジュール依存）。
+*   `--network_alpha=1`
+    *   LoRA のアルファ値 (alpha) を指定します。学習率のスケーリングに関係するパラメータで、一般的には `network_dim` の半分程度の値を指定することが推奨されますが、`network_dim` と同じ値を指定する場合もあります。デフォルトは 1 です。`network_dim` と同じ値に設定すると、旧バージョンと同様の挙動になります。
+
+#### 学習パラメータ
+
+*   `--learning_rate=1e-4`
+    *   学習率を指定します。LoRA 学習では（アルファ値が1の場合）比較的高めの値（例: `1e-4`から`1e-3`）が使われることが多いです。
+*   `--unet_lr=1e-4`
+    *   U-Net 部分の LoRA モジュールに対する学習率を個別に指定する場合に使用します。指定しない場合は `--learning_rate` の値が使用されます。
+*   `--text_encoder_lr=1e-5`
+    *   Text Encoder 部分の LoRA モジュールに対する学習率を個別に指定する場合に使用します。指定しない場合は `--learning_rate` の値が使用されます。U-Net よりも小さめの値が推奨されます。
+*   `--optimizer_type="AdamW8bit"`
+    *   学習に使用するオプティマイザを指定します。`AdamW8bit` (要 `bitsandbytes`), `AdamW`, `Lion` (要 `lion-pytorch`), `DAdaptation` (要 `dadaptation`), `Adafactor` などが選択可能です。`AdamW8bit` はメモリ効率が良く、広く使われています。
+*   `--lr_scheduler="constant"`
+    *   学習率スケジューラを指定します。学習の進行に合わせて学習率を変化させる方法です。`constant` (変化なし), `cosine` (コサインカーブ), `linear` (線形減衰), `constant_with_warmup` (ウォームアップ付き定数), `cosine_with_restarts` などが選択可能です。`constant`や`cosine` 、 `constant_with_warmup` がよく使われます。
+*   `--lr_warmup_steps=500`
+    *   学習率スケジューラのウォームアップステップ数を指定します。学習開始時に学習率を徐々に上げていく期間です。`lr_scheduler` がウォームアップをサポートする場合に有効です。
+*   `--max_train_steps=10000`
+    *   学習の総ステップ数を指定します。`max_train_epochs` が指定されている場合はそちらが優先されます。
+*   `--max_train_epochs=12`
+    *   学習のエポック数を指定します。これを指定すると `max_train_steps` は無視されます。
+*   `--sdpa`
+    *   Scaled Dot-Product Attention を使用します。LoRA の学習において、メモリ使用量を削減し、学習速度を向上させることができます。
+*   `--mixed_precision="fp16"`
+    *   混合精度学習の設定を指定します。`no` (無効), `fp16` (半精度), `bf16` (bfloat16) から選択できます。GPU が対応している場合は `fp16` または `bf16` を指定することで、学習速度の向上とメモリ使用量の削減が期待できます。
+*   `--gradient_accumulation_steps=1`
+    *   勾配を累積するステップ数を指定します。実質的なバッチサイズを `train_batch_size * gradient_accumulation_steps` に増やす効果があります。GPU メモリが足りない場合に大きな値を設定します。通常は `1` で問題ありません。
+
+#### その他
+
+*   `--seed=42`
+    *   乱数シードを指定します。学習の再現性を確保したい場合に設定します。
+*   `--logging_dir="<ログディレクトリ>"`
+    *   TensorBoard などのログを出力するディレクトリを指定します。指定しない場合、ログは出力されません。
+*   `--log_prefix="<プレフィックス>"`
+    *   `logging_dir` 内に作成されるサブディレクトリ名の接頭辞を指定します。
+*   `--gradient_checkpointing`
+    *   Gradient Checkpointing を有効にします。メモリ使用量を大幅に削減できますが、学習速度は若干低下します。メモリが厳しい場合に有効です。
+*   `--clip_skip=1`
+    *   Text Encoder の最後の層から数えて何層スキップするかを指定します。`2` を指定すると最後から 2 層目の出力を使用します。`None` または `1` はスキップなし（最後の層を使用）を意味します。学習対象のモデルの推奨する値を確認してください。
+</details>
+
+### 3.2. Starting the Training / 学習の開始
+
+After setting the necessary arguments and executing the command, training will begin. The progress of the training will be output to the console. If `logging_dir` is specified, you can visually check the training status (loss, learning rate, etc.) with TensorBoard.
+
+```bash
+tensorboard --logdir <directory specified by logging_dir>
+```
+
+<details>
+<summary>日本語</summary>
+
+必要な引数を設定し、コマンドを実行すると学習が開始されます。学習の進行状況はコンソールに出力されます。`logging_dir` を指定した場合は、TensorBoard などで学習状況（損失や学習率など）を視覚的に確認できます。
+</details>
+
+## 4. Using the Trained Model / 学習済みモデルの利用
+
+Once training is complete, a LoRA model file (`.safetensors` or `.ckpt`) with the name specified by `output_name` will be saved in the directory specified by `output_dir`.
+
+This file can be used with GUI tools such as AUTOMATIC1111/stable-diffusion-webui, ComfyUI, etc.
+
+<details>
+<summary>日本語</summary>
+
+学習が完了すると、`output_dir` で指定したディレクトリに、`output_name` で指定した名前の LoRA モデルファイル (`.safetensors` または `.ckpt`) が保存されます。
+
+このファイルは、AUTOMATIC1111/stable-diffusion-webui 、ComfyUI などの GUI ツールで利用できます。
+</details>
+
+## 5. Other Features / その他の機能
+
+`train_network.py` has many other options not introduced here.
+
+* Sample image generation (`--sample_prompts`, `--sample_every_n_steps`, etc.)
+* More detailed optimizer settings (`--optimizer_args`, etc.)
+* Caption preprocessing (`--shuffle_caption`, `--keep_tokens`, etc.)
+* Additional network settings (`--network_args`, etc.)
+
+For these features, please refer to the script's help (`python train_network.py --help`) or other documents in the repository.
+
+<details>
+<summary>日本語</summary>
+
+`train_network.py` には、ここで紹介した以外にも多くのオプションがあります。
+
+*   サンプル画像の生成 (`--sample_prompts`, `--sample_every_n_steps` など)
+*   より詳細なオプティマイザ設定 (`--optimizer_args` など)
+*   キャプションの前処理 (`--shuffle_caption`, `--keep_tokens` など)
+*   ネットワークの追加設定 (`--network_args` など)
+
+これらの機能については、スクリプトのヘルプ (`python train_network.py --help`) やリポジトリ内の他のドキュメントを参照してください。
+</details>
+
+docs\train_network_advanced.md:
+# Advanced Settings: Detailed Guide for SDXL LoRA Training Script `sdxl_train_network.py` / 高度な設定: SDXL LoRA学習スクリプト `sdxl_train_network.py` 詳細ガイド
+
+This document describes the advanced options available when training LoRA models for SDXL (Stable Diffusion XL) with `sdxl_train_network.py` in the `sd-scripts` repository. For the basics, please read [How to Use the LoRA Training Script `train_network.py`](train_network.md) and [How to Use the SDXL LoRA Training Script `sdxl_train_network.py`](sdxl_train_network.md).
+
+This guide targets experienced users who want to fine tune settings in detail.
+
+**Prerequisites:**
+
+* You have cloned the `sd-scripts` repository and prepared a Python environment.
+* A training dataset and its `.toml` configuration are ready (see the dataset configuration guide).
+* You are familiar with running basic LoRA training commands.
+
+## 1. Command Line Options / コマンドライン引数 詳細解説
+
+`sdxl_train_network.py` inherits the functionality of `train_network.py` and adds SDXL-specific features. Major options are grouped and explained below. For common arguments, see the other guides mentioned above.
+
+### 1.1. Model Loading
+
+* `--pretrained_model_name_or_path=\"<model path>\"` **[Required]**: specify the base SDXL model. Supports a Hugging Face model ID, a local Diffusers directory or a `.safetensors` file.
+* `--vae=\"<VAE path>\"`: optionally use a different VAE. Specify when using a VAE other than the one included in the SDXL model. Can specify `.ckpt` or `.safetensors` files.
+* `--no_half_vae`: keep the VAE in float32 even with fp16/bf16 training. The VAE for SDXL can become unstable with `float16`, so it is recommended to enable this when `fp16` is specified. Usually unnecessary for `bf16`.
+* `--fp8_base` / `--fp8_base_unet`: **Experimental**: load the base model (U-Net, Text Encoder) or just the U-Net in FP8 to reduce VRAM (requires PyTorch 2.1+). For details, refer to the relevant section in TODO add document later (this is an SD3 explanation but also applies to SDXL).
+
+### 1.2. Dataset Settings
+
+* `--dataset_config=\"<path to config>\"`: specify a `.toml` dataset config. High resolution data and aspect ratio buckets (specify `enable_bucket = true` in `.toml`) are common for SDXL. The resolution steps for aspect ratio buckets (`bucket_reso_steps`) must be multiples of 32 for SDXL. For details on writing `.toml` files, refer to the [Dataset Configuration Guide](link/to/dataset/config/doc).
+
+### 1.3. Output and Saving
+
+Options match `train_network.py`:
+
+* `--output_dir`, `--output_name` (both required)
+* `--save_model_as` (recommended `safetensors`), `ckpt`, `pt`, `diffusers`, `diffusers_safetensors`
+* `--save_precision=\"fp16\"`, `\"bf16\"`, `\"float\"`: Specifies the precision for saving the model. If not specified, the model is saved with the training precision (`fp16`, `bf16`, etc.).
+* `--save_every_n_epochs=N`, `--save_every_n_steps=N`: Saves the model every N epochs/steps.
+* `--save_last_n_epochs=M`, `--save_last_n_steps=M`: When saving at every epoch/step, only the latest M files are kept, and older ones are deleted.
+* `--save_state`, `--save_state_on_train_end`: Saves the training state (`state`), including Optimizer status, etc., when saving the model or at the end of training. Required for resuming training with the `--resume` option.
+* `--save_last_n_epochs_state=M`, `--save_last_n_steps_state=M`: Limits the number of saved `state` files to M. Overrides the `--save_last_n_epochs/steps` specification.
+* `--no_metadata`: Does not save metadata to the output model.
+* `--save_state_to_huggingface` and related options (e.g., `--huggingface_repo_id`): Options related to uploading models and states to Hugging Face Hub. See TODO add document for details.
+
+### 1.4. Network Parameters (LoRA)
+
+* `--network_module=networks.lora` **[Required]**
+* `--network_dim=N` **[Required]**: Specifies the rank (dimensionality) of LoRA. For SDXL, values like 32 or 64 are often tried, but adjustment is necessary depending on the dataset and purpose.
+* `--network_alpha=M`: LoRA alpha value. Generally around half of `network_dim` or the same value as `network_dim`. Default is 1.
+* `--network_dropout=P`: Dropout rate (0.0-1.0) within LoRA modules. Can be effective in suppressing overfitting. Default is None (no dropout).
+* `--network_args ...`: Allows advanced settings by specifying additional arguments to the network module in `key=value` format. For LoRA, the following advanced settings are available:
+    *   **Block-wise dimensions/alphas:**
+        *   Allows specifying different `dim` and `alpha` for each block of the U-Net. This enables adjustments to strengthen or weaken the influence of specific layers.
+        *   `block_dims`: Comma-separated dims for Linear and Conv2d 1x1 layers in U-Net (23 values for SDXL).
+        *   `block_alphas`: Comma-separated alpha values corresponding to the above.
+        *   `conv_block_dims`: Comma-separated dims for Conv2d 3x3 layers in U-Net.
+        *   `conv_block_alphas`: Comma-separated alpha values corresponding to the above.
+        *   Blocks not specified will use values from `--network_dim`/`--network_alpha` or `--conv_dim`/`--conv_alpha` (if they exist).
+        *   For details, refer to [Block-wise learning rate for LoRA](train_network.md#lora-の階層別学習率) (in train_network.md, applicable to SDXL) and the implementation ([lora.py](lora.py)).
+    *   **LoRA+:**
+        *   `loraplus_lr_ratio=R`: Sets the learning rate of LoRA's upward weights (UP) to R times the learning rate of downward weights (DOWN). Expected to improve learning speed. Paper recommends 16.
+        *   `loraplus_unet_lr_ratio=RU`: Specifies the LoRA+ learning rate ratio for the U-Net part individually.
+        *   `loraplus_text_encoder_lr_ratio=RT`: Specifies the LoRA+ learning rate ratio for the Text Encoder part individually (multiplied by the learning rates specified with `--text_encoder_lr1`, `--text_encoder_lr2`).
+        *   For details, refer to [README](../README.md#jan-17-2025--2025-01-17-version-090) and the implementation ([lora.py](lora.py)).
+* `--network_train_unet_only`: Trains only the LoRA modules of the U-Net. Specify this if not training Text Encoders. Required when using `--cache_text_encoder_outputs`.
+* `--network_train_text_encoder_only`: Trains only the LoRA modules of the Text Encoders. Specify this if not training the U-Net.
+* `--network_weights=\"<weight file>\"`: Starts training by loading pre-trained LoRA weights. Used for fine-tuning or resuming training. The difference from `--resume` is that this option only loads LoRA module weights, while `--resume` also restores Optimizer state, step count, etc.
+* `--dim_from_weights`: Automatically reads the LoRA dimension (`dim`) from the weight file specified by `--network_weights`. Specification of `--network_dim` becomes unnecessary.
+
+### 1.5. Training Parameters
+
+*   `--learning_rate=LR`: Sets the overall learning rate. This becomes the default value for each module (`unet_lr`, `text_encoder_lr1`, `text_encoder_lr2`). Values like `1e-3` or `1e-4` are often tried.
+*   `--unet_lr=LR_U`: Learning rate for the LoRA module of the U-Net part.
+*   `--text_encoder_lr1=LR_TE1`: Learning rate for the LoRA module of Text Encoder 1 (OpenCLIP ViT-G/14). Usually, a smaller value than U-Net (e.g., `1e-5`, `2e-5`) is recommended.
+*   `--text_encoder_lr2=LR_TE2`: Learning rate for the LoRA module of Text Encoder 2 (CLIP ViT-L/14). Usually, a smaller value than U-Net (e.g., `1e-5`, `2e-5`) is recommended.
+*   `--optimizer_type=\"...\"`: Specifies the optimizer to use. Options include `AdamW8bit` (memory-efficient, common), `Adafactor` (even more memory-efficient, proven in SDXL full model training), `Lion`, `DAdaptation`, `Prodigy`, etc. Each optimizer may require additional arguments (see `--optimizer_args`). `AdamW8bit` or `PagedAdamW8bit` (requires `bitsandbytes`) are common. `Adafactor` is memory-efficient but slightly complex to configure (relative step (`relative_step=True`) recommended, `adafactor` learning rate scheduler recommended). `DAdaptation`, `Prodigy` have automatic learning rate adjustment but cannot be used with LoRA+. Specify a learning rate around `1.0`. For details, see the `get_optimizer` function in [train_util.py](train_util.py).
+*   `--optimizer_args ...`: Specifies additional arguments to the optimizer in `key=value` format (e.g., `\"weight_decay=0.01\"` `\"betas=0.9,0.999\"`).
+*   `--lr_scheduler=\"...\"`: Specifies the learning rate scheduler. Options include `constant` (no change), `cosine` (cosine curve), `linear` (linear decay), `constant_with_warmup` (constant with warmup), `cosine_with_restarts`, etc. `constant`, `cosine`, and `constant_with_warmup` are commonly used. Some schedulers require additional arguments (see `--lr_scheduler_args`). If using optimizers with auto LR adjustment like `DAdaptation` or `Prodigy`, a scheduler is not needed (`constant` should be specified).
+*   `--lr_warmup_steps=N`: Number of warmup steps for the learning rate scheduler. The learning rate gradually increases during this period at the start of training. If N < 1, it's interpreted as a fraction of total steps.
+*   `--lr_scheduler_num_cycles=N` / `--lr_scheduler_power=P`: Parameters for specific schedulers (`cosine_with_restarts`, `polynomial`).
+*   `--max_train_steps=N` / `--max_train_epochs=N`: Specifies the total number of training steps or epochs. Epoch specification takes precedence.
+*   `--mixed_precision=\"bf16\"` / `\"fp16\"` / `\"no\"`: Mixed precision training settings. For SDXL, using `bf16` (if GPU supports it) or `fp16` is strongly recommended. Reduces VRAM usage and improves training speed.
+*   `--full_fp16` / `--full_bf16`: Performs gradient calculations entirely in half-precision/bf16. Can further reduce VRAM usage but may affect training stability. Use if VRAM is critically low.
+*   `--gradient_accumulation_steps=N`: Accumulates gradients for N steps before updating the optimizer. Effectively increases the batch size to `train_batch_size * N`, achieving the effect of a larger batch size with less VRAM. Default is 1.
+*   `--max_grad_norm=N`: Gradient clipping threshold. Clips gradients if their norm exceeds N. Default is 1.0. `0` disables it.
+*   `--gradient_checkpointing`: Significantly reduces memory usage but slightly decreases training speed. Recommended for SDXL due to high memory consumption.
+*   `--fused_backward_pass`: **Experimental**: Fuses gradient calculation and optimizer steps to reduce VRAM usage. Available for SDXL. Currently only supports `Adafactor` optimizer. Cannot be used with Gradient Accumulation.
+*   `--resume=\"<state directory>\"`: Resumes training from a saved state (saved with `--save_state`). Restores optimizer state, step count, etc.
+
+### 1.6. Caching
+
+Caching is effective for SDXL due to its high computational cost.
+
+*   `--cache_latents`: Caches VAE outputs (latents) in memory. Skips VAE computation, reducing VRAM usage and speeding up training. **Note:** Image augmentations (`color_aug`, `flip_aug`, `random_crop`, etc.) will be disabled.
+*   `--cache_latents_to_disk`: Used with `--cache_latents` to cache to disk. Particularly effective for large datasets or multiple training runs. Caches are generated on disk during the first run and loaded from there on subsequent runs.
+*   `--cache_text_encoder_outputs`: Caches Text Encoder outputs in memory. Skips Text Encoder computation, reducing VRAM usage and speeding up training. **Note:** Caption augmentations (`shuffle_caption`, `caption_dropout_rate`, etc.) will be disabled. **Also, when using this option, Text Encoder LoRA modules cannot be trained (requires `--network_train_unet_only`).**
+*   `--cache_text_encoder_outputs_to_disk`: Used with `--cache_text_encoder_outputs` to cache to disk.
+*   `--skip_cache_check`: Skips validation of cache file contents. File existence is checked, and if not found, caches are generated. Usually not needed unless intentionally re-caching for debugging, etc.
+
+### 1.7. Sample Image Generation
+
+Basic options are common with `train_network.py`.
+
+*   `--sample_every_n_steps=N` / `--sample_every_n_epochs=N`: Generates sample images every N steps/epochs.
+*   `--sample_at_first`: Generates sample images before training starts.
+*   `--sample_prompts=\"<prompt file>\"`: Specifies a file (`.txt`, `.toml`, `.json`) containing prompts for sample image generation. Format follows [gen_img_diffusers.py](gen_img_diffusers.py). See [documentation](gen_img_README-ja.md) for details.
+*   `--sample_sampler=\"...\"`: Specifies the sampler (scheduler) for sample image generation. `euler_a`, `dpm++_2m_karras`, etc., are common. See `--help` for choices.
+
+### 1.8. Logging & Tracking
+
+*   `--logging_dir=\"<log directory>\"`: Specifies the directory for TensorBoard and other logs. If not specified, logs are not output.
+*   `--log_with=\"tensorboard\"` / `\"wandb\"` / `\"all\"`: Specifies the logging tool to use. If using `wandb`, `pip install wandb` is required.
+*   `--log_prefix=\"<prefix>\"`: Specifies the prefix for subdirectory names created within `logging_dir`.
+*   `--wandb_api_key=\"<API key>\"` / `--wandb_run_name=\"<run name>\"`: Options for Weights & Biases (wandb).
+*   `--log_tracker_name` / `--log_tracker_config`: Advanced tracker configuration options. Usually not needed.
+*   `--log_config`: Logs the training configuration used (excluding some sensitive information) at the start of training. Helps ensure reproducibility.
+
+### 1.9. Regularization and Advanced Techniques
+
+*   `--noise_offset=N`: Enables noise offset and specifies its value. Expected to improve bias in image brightness and contrast. Recommended to enable as SDXL base models are trained with this (e.g., 0.0357). Original technical explanation [here](https://www.crosslabs.org/blog/diffusion-with-offset-noise).
+*   `--noise_offset_random_strength`: Randomly varies noise offset strength between 0 and the specified value.
+*   `--adaptive_noise_scale=N`: Adjusts noise offset based on the mean absolute value of latents. Used with `--noise_offset`.
+*   `--multires_noise_iterations=N` / `--multires_noise_discount=D`: Enables multi-resolution noise. Adding noise of different frequency components is expected to improve detail reproduction. Specify iteration count N (around 6-10) and discount rate D (around 0.3). Technical explanation [here](https://wandb.ai/johnowhitaker/multires_noise/reports/Multi-Resolution-Noise-for-Diffusion-Model-Training--VmlldzozNjYyOTU2).
+*   `--ip_noise_gamma=G` / `--ip_noise_gamma_random_strength`: Enables Input Perturbation Noise. Adds small noise to input (latents) for regularization. Specify Gamma value (around 0.1). Strength can be randomized with `random_strength`.
+*   `--min_snr_gamma=N`: Applies Min-SNR Weighting Strategy. Adjusts loss weights for timesteps with high noise in early training to stabilize learning. `N=5` etc. are used.
+*   `--scale_v_pred_loss_like_noise_pred`: In v-prediction models, scales v-prediction loss similarly to noise prediction loss. **Not typically used for SDXL** as it's not a v-prediction model.
+*   `--v_pred_like_loss=N`: Adds v-prediction-like loss to noise prediction models. `N` specifies its weight. **Not typically used for SDXL**.
+*   `--debiased_estimation_loss`: Calculates loss using Debiased Estimation. Similar purpose to Min-SNR but a different approach.
+*   `--loss_type=\"l1\"` / `\"l2\"` / `\"huber\"` / `\"smooth_l1\"`: Specifies the loss function. Default is `l2` (MSE). `huber` and `smooth_l1` are robust to outliers.
+*   `--huber_schedule=\"constant\"` / `\"exponential\"` / `\"snr\"`: Scheduling method when using `huber` or `smooth_l1` loss. `snr` is recommended.
+*   `--huber_c=C` / `--huber_scale=S`: Parameters for `huber` or `smooth_l1` loss.
+*   `--masked_loss`: Limits loss calculation area based on a mask image. Requires specifying mask images (black and white) in `conditioning_data_dir` in dataset settings. See [About Masked Loss](masked_loss_README.md) for details.
+
+### 1.10. Distributed Training and Other Training Related Options
+
+*   `--seed=N`: Specifies the random seed. Set this to ensure training reproducibility.
+*   `--max_token_length=N` (`75`, `150`, `225`): Maximum token length processed by Text Encoders. For SDXL, typically `75` (default), `150`, or `225`. Longer lengths can handle more complex prompts but increase VRAM usage.
+*   `--clip_skip=N`: Uses the output from N layers skipped from the final layer of Text Encoders. **Not typically used for SDXL**.
+*   `--lowram` / `--highvram`: Options for memory usage optimization. `--lowram` is for environments like Colab where RAM < VRAM, `--highvram` is for environments with ample VRAM.
+*   `--persistent_data_loader_workers` / `--max_data_loader_n_workers=N`: Settings for DataLoader worker processes. Affects wait time between epochs and memory usage.
+*   `--config_file="<config file>"` / `--output_config`: Options to use/output a `.toml` file instead of command line arguments.
+*   **Accelerate/DeepSpeed related:** (`--ddp_timeout`, `--ddp_gradient_as_bucket_view`, `--ddp_static_graph`): Detailed settings for distributed training. Accelerate settings (`accelerate config`) are usually sufficient. DeepSpeed requires separate configuration.
+* `--initial_epoch=<integer>` – Sets the initial epoch number. `1` means first epoch (same as not specifying). Note: `initial_epoch`/`initial_step` doesn't affect the lr scheduler, which means lr scheduler will start from 0 without `--resume`.
+* `--initial_step=<integer>` – Sets the initial step number including all epochs. `0` means first step (same as not specifying). Overwrites `initial_epoch`.
+* `--skip_until_initial_step` – Skips training until `initial_step` is reached.
+
+### 1.11. Console and Logging / コンソールとログ
+
+* `--console_log_level`: Sets the logging level for the console output. Choose from `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`.
+* `--console_log_file`: Redirects console logs to a specified file.
+* `--console_log_simple`: Enables a simpler log format.
+
+### 1.12. Hugging Face Hub Integration / Hugging Face Hub 連携
+
+* `--huggingface_repo_id`: The repository name on Hugging Face Hub to upload the model to (e.g., `your-username/your-model`).
+* `--huggingface_repo_type`: The type of repository on Hugging Face Hub. Usually `model`.
+* `--huggingface_path_in_repo`: The path within the repository to upload files to.
+* `--huggingface_token`: Your Hugging Face Hub authentication token.
+* `--huggingface_repo_visibility`: Sets the visibility of the repository (`public` or `private`).
+* `--resume_from_huggingface`: Resumes training from a state saved on Hugging Face Hub.
+* `--async_upload`: Enables asynchronous uploading of models to the Hub, preventing it from blocking the training process.
+* `--save_n_epoch_ratio`: Saves the model at a certain ratio of total epochs. For example, `5` will save at least 5 checkpoints throughout the training.
+
+### 1.13. Advanced Attention Settings / 高度なAttention設定
+
+* `--mem_eff_attn`: Use memory-efficient attention mechanism. This is an older implementation and `sdpa` or `xformers` are generally recommended.
+* `--xformers`: Use xformers library for memory-efficient attention. Requires `pip install xformers`.
+
+### 1.14. Advanced LR Scheduler Settings / 高度な学習率スケジューラ設定
+
+* `--lr_scheduler_type`: Specifies a custom scheduler module.
+* `--lr_scheduler_args`: Provides additional arguments to the custom scheduler (e.g., `"T_max=100"`).
+* `--lr_decay_steps`: Sets the number of steps for the learning rate to decay.
+* `--lr_scheduler_timescale`: The timescale for the inverse square root scheduler.
+* `--lr_scheduler_min_lr_ratio`: Sets the minimum learning rate as a ratio of the initial learning rate for certain schedulers.
+
+### 1.15. Differential Learning with LoRA / LoRAの差分学習
+
+This technique involves merging a pre-trained LoRA into the base model before starting a new training session. This is useful for fine-tuning an existing LoRA or for learning the 'difference' from it.
+
+* `--base_weights`: Path to one or more LoRA weight files to be merged into the base model before training begins.
+* `--base_weights_multiplier`: A multiplier for the weights of the LoRA specified by `--base_weights`. You can specify multiple values if you provide multiple weights.
+
+### 1.16. Other Miscellaneous Options / その他のオプション
+
+* `--tokenizer_cache_dir`: Specifies a directory to cache the tokenizer, which is useful for offline training.
+* `--scale_weight_norms`: Scales the weight norms of the LoRA modules. This can help prevent overfitting by controlling the magnitude of the weights. A value of `1.0` is a good starting point.
+* `--disable_mmap_load_safetensors`: Disables memory-mapped loading for `.safetensors` files. This can speed up model loading in some environments like WSL.
+
+## 2. Other Tips / その他のTips
+
+
+*   **VRAM Usage:** SDXL LoRA training requires a lot of VRAM. Even with 24GB VRAM, you might run out of memory depending on settings. Reduce VRAM usage with these settings:
+    *   `--mixed_precision=\"bf16\"` or `\"fp16\"` (essential)
+    *   `--gradient_checkpointing` (strongly recommended)
+    *   `--cache_latents` / `--cache_text_encoder_outputs` (highly effective, with limitations)
+    *   `--optimizer_type=\"AdamW8bit\"` or `\"Adafactor\"`
+    *   Increase `--gradient_accumulation_steps` (reduce batch size)
+    *   `--full_fp16` / `--full_bf16` (be mindful of stability)
+    *   `--fp8_base` / `--fp8_base_unet` (experimental)
+    *   `--fused_backward_pass` (Adafactor only, experimental)
+*   **Learning Rate:** Appropriate learning rates for SDXL LoRA depend on the dataset and `network_dim`/`alpha`. Starting around `1e-4` ~ `4e-5` (U-Net), `1e-5` ~ `2e-5` (Text Encoders) is common.
+*   **Training Time:** Training takes time due to high-resolution data and the size of the SDXL model. Using caching features and appropriate hardware is important.
+*   **Troubleshooting:**
+    *   **NaN Loss:** Learning rate might be too high, mixed precision settings incorrect (e.g., `--no_half_vae` not specified with `fp16`), or dataset issues.
+    *   **Out of Memory (OOM):** Try the VRAM reduction measures listed above.
+    *   **Training not progressing:** Learning rate might be too low, optimizer/scheduler settings incorrect, or dataset issues.
+
+## 3. Conclusion / おわりに
+
+`sdxl_train_network.py` offers many options to customize SDXL LoRA training. Refer to `--help`, other documents and the source code for further details.
+
+<details>
+<summary>日本語</summary>
+
+# 高度な設定: SDXL LoRA学習スクリプト `sdxl_train_network.py` 詳細ガイド
+
+このドキュメントでは、`sd-scripts` リポジトリに含まれる `sdxl_train_network.py` を使用した、SDXL (Stable Diffusion XL) モデルに対する LoRA (Low-Rank Adaptation) モデル学習の高度な設定オプションについて解説します。
+
+基本的な使い方については、以下のドキュメントを参照してください。
+
+*   [LoRA学習スクリプト `train_network.py` の使い方](train_network.md)
+*   [SDXL LoRA学習スクリプト `sdxl_train_network.py` の使い方](sdxl_train_network.md)
+
+このガイドは、基本的なLoRA学習の経験があり、より詳細な設定や高度な機能を試したい熟練した利用者を対象としています。
+
+**前提条件:**
+
+*   `sd-scripts` リポジトリのクローンと Python 環境のセットアップが完了していること。
+*   学習用データセットの準備と設定（`.toml`ファイル）が完了していること。（[データセット設定ガイド](link/to/dataset/config/doc)参照）
+*   基本的なLoRA学習のコマンドライン実行経験があること。
+
+## 1. コマンドライン引数 詳細解説
+
+`sdxl_train_network.py` は `train_network.py` の機能を継承しつつ、SDXL特有の機能を追加しています。ここでは、SDXL LoRA学習に関連する主要なコマンドライン引数について、機能別に分類して詳細に解説します。
+
+基本的な引数については、[LoRA学習スクリプト `train_network.py` の使い方](train_network.md#31-主要なコマンドライン引数) および [SDXL LoRA学習スクリプト `sdxl_train_network.py` の使い方](sdxl_train_network.md#31-主要なコマンドライン引数（差分）) を参照してください。
+
+### 1.1. モデル読み込み関連
+
+*   `--pretrained_model_name_or_path="<モデルパス>"` **[必須]**
+    *   学習のベースとなる **SDXLモデル** を指定します。Hugging Face HubのモデルID、ローカルのDiffusers形式モデルディレクトリ、または`.safetensors`ファイルを指定できます。
+    *   詳細は[基本ガイド](sdxl_train_network.md#モデル関連)を参照してください。
+*   `--vae="<VAEパス>"`
+    *   オプションで、学習に使用するVAEを指定します。SDXLモデルに含まれるVAE以外を使用する場合に指定します。`.ckpt`または`.safetensors`ファイルを指定できます。
+*   `--no_half_vae`
+    *   混合精度(`fp16`/`bf16`)使用時でもVAEを`float32`で動作させます。SDXLのVAEは`float16`で不安定になることがあるため、`fp16`指定時には有効にすることが推奨されます。`bf16`では通常不要です。
+*   `--fp8_base` / `--fp8_base_unet`
+    *   **実験的機能:** ベースモデル（U-Net, Text Encoder）またはU-NetのみをFP8で読み込み、VRAM使用量を削減します。PyTorch 2.1以上が必要です。詳細は TODO 後でドキュメントを追加 の関連セクションを参照してください (SD3の説明ですがSDXLにも適用されます)。
+
+### 1.2. データセット設定関連
+
+*   `--dataset_config="<設定ファイルのパス>"` 
+    *   データセットの設定を記述した`.toml`ファイルを指定します。SDXLでは高解像度データとバケツ機能（`.toml` で `enable_bucket = true` を指定）の利用が一般的です。
+    *   `.toml`ファイルの書き方の詳細は[データセット設定ガイド](link/to/dataset/config/doc)を参照してください。
+    *   アスペクト比バケツの解像度ステップ(`bucket_reso_steps`)は、SDXLでは32の倍数とする必要があります。
+
+### 1.3. 出力・保存関連
+
+基本的なオプションは `train_network.py` と共通です。
+
+*   `--output_dir="<出力先ディレクトリ>"` **[必須]**
+*   `--output_name="<出力ファイル名>"` **[必須]**
+*   `--save_model_as="safetensors"` (推奨), `ckpt`, `pt`, `diffusers`, `diffusers_safetensors`
+*   `--save_precision="fp16"`, `"bf16"`, `"float"`
+    *   モデルの保存精度を指定します。未指定時は学習時の精度(`fp16`, `bf16`等)で保存されます。
+*   `--save_every_n_epochs=N` / `--save_every_n_steps=N`
+    *   Nエポック/ステップごとにモデルを保存します。
+*   `--save_last_n_epochs=M` / `--save_last_n_steps=M`
+    *   エポック/ステップごとに保存する際、最新のM個のみを保持し、古いものは削除します。
+*   `--save_state` / `--save_state_on_train_end`
+    *   モデル保存時/学習終了時に、Optimizerの状態などを含む学習状態(`state`)を保存します。`--resume`オプションでの学習再開に必要です。
+*   `--save_last_n_epochs_state=M` / `--save_last_n_steps_state=M`
+    *   `state`の保存数をM個に制限します。`--save_last_n_epochs/steps`の指定を上書きします。
+*   `--no_metadata`
+    *   出力モデルにメタデータを保存しません。
+*   `--save_state_to_huggingface` / `--huggingface_repo_id` など
+    *   Hugging Face Hubへのモデルやstateのアップロード関連オプション。詳細は TODO ドキュメントを追加 を参照してください。
+
+### 1.4. ネットワークパラメータ (LoRA)
+
+基本的なオプションは `train_network.py` と共通です。
+
+*   `--network_module=networks.lora` **[必須]**
+*   `--network_dim=N` **[必須]**
+    *   LoRAのランク (次元数) を指定します。SDXLでは32や64などが試されることが多いですが、データセットや目的に応じて調整が必要です。
+*   `--network_alpha=M`
+    *   LoRAのアルファ値。`network_dim`の半分程度、または`network_dim`と同じ値などが一般的です。デフォルトは1。
+*   `--network_dropout=P`
+    *   LoRAモジュール内のドロップアウト率 (0.0~1.0)。過学習抑制の効果が期待できます。デフォルトはNone (ドロップアウトなし)。
+*   `--network_args ...`
+    *   ネットワークモジュールへの追加引数を `key=value` 形式で指定します。LoRAでは以下の高度な設定が可能です。
+        *   **階層別 (Block-wise) 次元数/アルファ:**
+            *   U-Netの各ブロックごとに異なる`dim`と`alpha`を指定できます。これにより、特定の層の影響を強めたり弱めたりする調整が可能です。
+            *   `block_dims`: U-NetのLinear層およびConv2d 1x1層に対するブロックごとのdimをカンマ区切りで指定します (SDXLでは23個の数値)。
+            *   `block_alphas`: 上記に対応するalpha値をカンマ区切りで指定します。
+            *   `conv_block_dims`: U-NetのConv2d 3x3層に対するブロックごとのdimをカンマ区切りで指定します。
+            *   `conv_block_alphas`: 上記に対応するalpha値をカンマ区切りで指定します。
+            *   指定しないブロックは `--network_dim`/`--network_alpha` または `--conv_dim`/`--conv_alpha` (存在する場合) の値が使用されます。
+            *   詳細は[LoRA の階層別学習率](train_network.md#lora-の階層別学習率) (train\_network.md内、SDXLでも同様に適用可能) や実装 ([lora.py](lora.py)) を参照してください。
+        *   **LoRA+:**
+            *   `loraplus_lr_ratio=R`: LoRAの上向き重み(UP)の学習率を、下向き重み(DOWN)の学習率のR倍にします。学習速度の向上が期待できます。論文推奨は16。
+            *   `loraplus_unet_lr_ratio=RU`: U-Net部分のLoRA+学習率比を個別に指定します。
+            *   `loraplus_text_encoder_lr_ratio=RT`: Text Encoder部分のLoRA+学習率比を個別に指定します。(`--text_encoder_lr1`, `--text_encoder_lr2`で指定した学習率に乗算されます)
+            *   詳細は[README](../README.md#jan-17-2025--2025-01-17-version-090)や実装 ([lora.py](lora.py)) を参照してください。
+*   `--network_train_unet_only`
+    *   U-NetのLoRAモジュールのみを学習します。Text Encoderの学習を行わない場合に指定します。`--cache_text_encoder_outputs` を使用する場合は必須です。
+*   `--network_train_text_encoder_only`
+    *   Text EncoderのLoRAモジュールのみを学習します。U-Netの学習を行わない場合に指定します。
+*   `--network_weights="<重みファイル>"`
+    *   学習済みのLoRA重みを読み込んで学習を開始します。ファインチューニングや学習再開に使用します。`--resume` との違いは、このオプションはLoRAモジュールの重みのみを読み込み、`--resume` はOptimizerの状態や学習ステップ数なども復元します。
+*   `--dim_from_weights`
+    *   `--network_weights` で指定した重みファイルからLoRAの次元数 (`dim`) を自動的に読み込みます。`--network_dim` の指定は不要になります。
+
+### 1.5. 学習パラメータ
+
+*   `--learning_rate=LR`
+    *   全体の学習率。各モジュール(`unet_lr`, `text_encoder_lr1`, `text_encoder_lr2`)のデフォルト値となります。`1e-3` や `1e-4` などが試されることが多いです。
+*   `--unet_lr=LR_U`
+    *   U-Net部分のLoRAモジュールの学習率。
+*   `--text_encoder_lr1=LR_TE1`
+    *   Text Encoder 1 (OpenCLIP ViT-G/14) のLoRAモジュールの学習率。通常、U-Netより小さい値 (例: `1e-5`, `2e-5`) が推奨されます。
+*   `--text_encoder_lr2=LR_TE2`
+    *   Text Encoder 2 (CLIP ViT-L/14) のLoRAモジュールの学習率。通常、U-Netより小さい値 (例: `1e-5`, `2e-5`) が推奨されます。
+*   `--optimizer_type="..."`
+    *   使用するOptimizerを指定します。`AdamW8bit` (省メモリ、一般的), `Adafactor` (さらに省メモリ、SDXLフルモデル学習で実績あり), `Lion`, `DAdaptation`, `Prodigy`などが選択可能です。各Optimizerには追加の引数が必要な場合があります (`--optimizer_args`参照)。
+    *   `AdamW8bit` や `PagedAdamW8bit` (要 `bitsandbytes`) が一般的です。
+    *   `Adafactor` はメモリ効率が良いですが、設定がやや複雑です (相対ステップ(`relative_step=True`)推奨、学習率スケジューラは`adafactor`推奨)。
+    *   `DAdaptation`, `Prodigy` は学習率の自動調整機能がありますが、LoRA+との併用はできません。学習率は`1.0`程度を指定します。
+    *   詳細は[train\_util.py](train_util.py)の`get_optimizer`関数を参照してください。
+*   `--optimizer_args ...`
+    *   Optimizerへの追加引数を `key=value` 形式で指定します (例: `"weight_decay=0.01"` `"betas=0.9,0.999"`).
+*   `--lr_scheduler="..."`
+    *   学習率スケジューラを指定します。`constant` (変化なし), `cosine` (コサインカーブ), `linear` (線形減衰), `constant_with_warmup` (ウォームアップ付き定数), `cosine_with_restarts` など。`constant` や `cosine` 、 `constant_with_warmup` がよく使われます。
+    *   スケジューラによっては追加の引数が必要です (`--lr_scheduler_args`参照)。
+    *   `DAdaptation` や `Prodigy` などの自己学習率調整機能付きOptimizerを使用する場合、スケジューラは不要です (`constant` を指定)。
+*   `--lr_warmup_steps=N`
+    *   学習率スケジューラのウォームアップステップ数。学習開始時に学習率を徐々に上げていく期間です。N < 1 の場合は全ステップ数に対する割合と解釈されます。
+*   `--lr_scheduler_num_cycles=N` / `--lr_scheduler_power=P`
+    *   特定のスケジューラ (`cosine_with_restarts`, `polynomial`) のためのパラメータ。
+*   `--max_train_steps=N` / `--max_train_epochs=N`
+    *   学習の総ステップ数またはエポック数を指定します。エポック指定が優先されます。
+*   `--mixed_precision="bf16"` / `"fp16"` / `"no"`
+    *   混合精度学習の設定。SDXLでは `bf16` (対応GPUの場合) または `fp16` の使用が強く推奨されます。VRAM使用量を削減し、学習速度を向上させます。
+*   `--full_fp16` / `--full_bf16`
+    *   勾配計算も含めて完全に半精度/bf16で行います。VRAM使用量をさらに削減できますが、学習の安定性に影響する可能性があります。VRAMがどうしても足りない場合に使用します。
+*   `--gradient_accumulation_steps=N`
+    *   勾配をNステップ分蓄積してからOptimizerを更新します。実質的なバッチサイズを `train_batch_size * N` に増やし、少ないVRAMで大きなバッチサイズ相当の効果を得られます。デフォルトは1。
+*   `--max_grad_norm=N`
+    *   勾配クリッピングの閾値。勾配のノルムがNを超える場合にクリッピングします。デフォルトは1.0。`0`で無効。
+*   `--gradient_checkpointing`
+    *   メモリ使用量を大幅に削減しますが、学習速度は若干低下します。SDXLではメモリ消費が大きいため、有効にすることが推奨されます。
+*   `--fused_backward_pass`
+    *   **実験的機能:** 勾配計算とOptimizerのステップを融合し、VRAM使用量を削減します。SDXLで利用可能です。現在 `Adafactor` Optimizerのみ対応。Gradient Accumulationとは併用できません。
+*   `--resume="<stateディレクトリ>"`
+    *   `--save_state`で保存された学習状態から学習を再開します。Optimizerの状態や学習ステップ数などが復元されます。
+
+### 1.6. キャッシュ機能関連
+
+SDXLは計算コストが高いため、キャッシュ機能が効果的です。
+
+*   `--cache_latents`
+    *   VAEの出力(Latent)をメモリにキャッシュします。VAEの計算を省略でき、VRAM使用量を削減し、学習を高速化します。**注意:** 画像に対するAugmentation (`color_aug`, `flip_aug`, `random_crop` 等) は無効になります。
+*   `--cache_latents_to_disk`
+    *   `--cache_latents` と併用し、キャッシュ先をディスクにします。大量のデータセットや複数回の学習で特に有効です。初回実行時にディスクにキャッシュが生成され、2回目以降はそれを読み込みます。
+*   `--cache_text_encoder_outputs`
+    *   Text Encoderの出力をメモリにキャッシュします。Text Encoderの計算を省略でき、VRAM使用量を削減し、学習を高速化します。**注意:** キャプションに対するAugmentation (`shuffle_caption`, `caption_dropout_rate` 等) は無効になります。**また、このオプションを使用する場合、Text EncoderのLoRAモジュールは学習できません (`--network_train_unet_only` の指定が必須です)。**
+*   `--cache_text_encoder_outputs_to_disk`
+    *   `--cache_text_encoder_outputs` と併用し、キャッシュ先をディスクにします。
+*   `--skip_cache_check`
+    *   キャッシュファイルの内容の検証をスキップします。ファイルの存在確認は行われ、存在しない場合はキャッシュが生成されます。デバッグ等で意図的に再キャッシュしたい場合を除き、通常は指定不要です。
+
+### 1.7. サンプル画像生成関連
+
+基本的なオプションは `train_network.py` と共通です。
+
+*   `--sample_every_n_steps=N` / `--sample_every_n_epochs=N`
+    *   Nステップ/エポックごとにサンプル画像を生成します。
+*   `--sample_at_first`
+    *   学習開始前にサンプル画像を生成します。
+*   `--sample_prompts="<プロンプトファイル>"`
+    *   サンプル画像生成に使用するプロンプトを記述したファイル (`.txt`, `.toml`, `.json`) を指定します。書式は[gen\_img\_diffusers.py](gen_img_diffusers.py)に準じます。詳細は[ドキュメント](gen_img_README-ja.md)を参照してください。
+*   `--sample_sampler="..."`
+    *   サンプル画像生成時のサンプラー（スケジューラ）を指定します。`euler_a`, `dpm++_2m_karras` などが一般的です。選択肢は `--help` を参照してください。
+
+### 1.8. Logging & Tracking 関連
+
+*   `--logging_dir="<ログディレクトリ>"`
+    *   TensorBoardなどのログを出力するディレクトリを指定します。指定しない場合、ログは出力されません。
+*   `--log_with="tensorboard"` / `"wandb"` / `"all"`
+    *   使用するログツールを指定します。`wandb`を使用する場合、`pip install wandb`が必要です。
+*   `--log_prefix="<プレフィックス>"`
+    *   `logging_dir` 内に作成されるサブディレクトリ名の接頭辞を指定します。
+*   `--wandb_api_key="<APIキー>"` / `--wandb_run_name="<実行名>"`
+    *   Weights & Biases (wandb) 使用時のオプション。
+*   `--log_tracker_name` / `--log_tracker_config`
+    *   高度なトラッカー設定用オプション。通常は指定不要。
+*   `--log_config`
+    *   学習開始時に、使用された学習設定（一部の機密情報を除く）をログに出力します。再現性の確保に役立ちます。
+
+### 1.9. 正則化・高度な学習テクニック関連
+
+*   `--noise_offset=N`
+    *   ノイズオフセットを有効にし、その値を指定します。画像の明るさやコントラストの偏りを改善する効果が期待できます。SDXLのベースモデルはこの値で学習されているため、有効にすることが推奨されます (例: 0.0357)。元々の技術解説は[こちら](https://www.crosslabs.org/blog/diffusion-with-offset-noise)。
+*   `--noise_offset_random_strength`
+    *   ノイズオフセットの強度を0から指定値の間でランダムに変動させます。
+*   `--adaptive_noise_scale=N`
+    *   Latentの平均絶対値に応じてノイズオフセットを調整します。`--noise_offset`と併用します。
+*   `--multires_noise_iterations=N` / `--multires_noise_discount=D`
+    *   複数解像度ノイズを有効にします。異なる周波数成分のノイズを加えることで、ディテールの再現性を向上させる効果が期待できます。イテレーション回数N (6-10程度) と割引率D (0.3程度) を指定します。技術解説は[こちら](https://wandb.ai/johnowhitaker/multires_noise/reports/Multi-Resolution-Noise-for-Diffusion-Model-Training--VmlldzozNjYyOTU2)。
+*   `--ip_noise_gamma=G` / `--ip_noise_gamma_random_strength`
+    *   Input Perturbation Noiseを有効にします。入力(Latent)に微小なノイズを加えて正則化を行います。Gamma値 (0.1程度) を指定します。`random_strength`で強度をランダム化できます。
+*   `--min_snr_gamma=N`
+    *   Min-SNR Weighting Strategy を適用します。学習初期のノイズが大きいタイムステップでのLossの重みを調整し、学習を安定させます。`N=5` などが使用されます。
+*   `--scale_v_pred_loss_like_noise_pred`
+    *   v-predictionモデルにおいて、vの予測ロスをノイズ予測ロスと同様のスケールに調整します。SDXLはv-predictionではないため、**通常は使用しません**。
+*   `--v_pred_like_loss=N`
+    *   ノイズ予測モデルにv予測ライクなロスを追加します。`N`でその重みを指定します。SDXLでは**通常は使用しません**。
+*   `--debiased_estimation_loss`
+    *   Debiased EstimationによるLoss計算を行います。Min-SNRと類似の目的を持ちますが、異なるアプローチです。
+*   `--loss_type="l1"` / `"l2"` / `"huber"` / `"smooth_l1"`
+    *   損失関数を指定します。デフォルトは`l2` (MSE)。`huber`や`smooth_l1`は外れ値に頑健な損失関数です。
+*   `--huber_schedule="constant"` / `"exponential"` / `"snr"`
+    *   `huber`または`smooth_l1`損失使用時のスケジューリング方法。`snr`が推奨されています。
+*   `--huber_c=C` / `--huber_scale=S`
+    *   `huber`または`smooth_l1`損失のパラメータ。
+*   `--masked_loss`
+    *   マスク画像に基づいてLoss計算領域を限定します。データセット設定で`conditioning_data_dir`にマスク画像（白黒）を指定する必要があります。詳細は[マスクロスについて](masked_loss_README.md)を参照してください。
+
+### 1.10. 分散学習、その他学習関連
+
+*   `--seed=N`
+    *   乱数シードを指定します。学習の再現性を確保したい場合に設定します。
+*   `--max_token_length=N` (`75`, `150`, `225`)
+    *   Text Encoderが処理するトークンの最大長。SDXLでは通常`75` (デフォルト) または `150`, `225`。長くするとより複雑なプロンプトを扱えますが、VRAM使用量が増加します。
+*   `--clip_skip=N`
+    *   Text Encoderの最終層からN層スキップした層の出力を使用します。SDXLでは**通常使用しません**。
+*   `--lowram` / `--highvram`
+    *   メモリ使用量の最適化に関するオプション。`--lowram`はColabなどRAM < VRAM環境向け、`--highvram`はVRAM潤沢な環境向け。
+*   `--persistent_data_loader_workers` / `--max_data_loader_n_workers=N`
+    *   DataLoaderのワーカプロセスに関する設定。エポック間の待ち時間やメモリ使用量に影響します。
+*   `--config_file="<設定ファイル>"` / `--output_config`
+    *   コマンドライン引数の代わりに`.toml`ファイルを使用/出力するオプション。
+*   **Accelerate/DeepSpeed関連:** (`--ddp_timeout`, `--ddp_gradient_as_bucket_view`, `--ddp_static_graph`)
+    *   分散学習時の詳細設定。通常はAccelerateの設定 (`accelerate config`) で十分です。DeepSpeedを使用する場合は、別途設定が必要です。
+*   `--initial_epoch=<integer>` – 開始エポック番号を設定します。`1`で最初のエポック（未指定時と同じ）。注意：`initial_epoch`/`initial_step`はlr schedulerに影響しないため、`--resume`しない場合はlr schedulerは0から始まります。
+*   `--initial_step=<integer>` – 全エポックを含む開始ステップ番号を設定します。`0`で最初のステップ（未指定時と同じ）。`initial_epoch`を上書きします。
+*   `--skip_until_initial_step` – `initial_step`に到達するまで学習をスキップします。
+
+### 1.11. コンソールとログ
+
+* `--console_log_level`: コンソール出力のログレベルを設定します。`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`から選択します。
+* `--console_log_file`: コンソールのログを指定されたファイルに出力します。
+* `--console_log_simple`: よりシンプルなログフォーマットを有効にします。
+
+### 1.12. Hugging Face Hub 連携
+
+* `--huggingface_repo_id`: モデルをアップロードするHugging Face Hubのリポジトリ名 (例: `your-username/your-model`)。
+* `--huggingface_repo_type`: Hugging Face Hubのリポジトリの種類。通常は`model`です。
+* `--huggingface_path_in_repo`: リポジトリ内でファイルをアップロードするパス。
+* `--huggingface_token`: Hugging Face Hubの認証トークン。
+* `--huggingface_repo_visibility`: リポジトリの公開設定 (`public`または`private`)。
+* `--resume_from_huggingface`: Hugging Face Hubに保存された状態から学習を再開します。
+* `--async_upload`: Hubへのモデルの非同期アップロードを有効にし、学習プロセスをブロックしないようにします。
+* `--save_n_epoch_ratio`: 総エポック数に対する特定の比率でモデルを保存します。例えば`5`を指定すると、学習全体で少なくとも5つのチェックポイントが保存されます。
+
+### 1.13. 高度なAttention設定
+
+* `--mem_eff_attn`: メモリ効率の良いAttentionメカニズムを使用します。これは古い実装であり、一般的には`sdpa`や`xformers`の使用が推奨されます。
+* `--xformers`: メモリ効率の良いAttentionのためにxformersライブラリを使用します。`pip install xformers`が必要です。
+
+### 1.14. 高度な学習率スケジューラ設定
+
+* `--lr_scheduler_type`: カスタムスケジューラモジュールを指定します。
+* `--lr_scheduler_args`: カスタムスケジューラに追加の引数を渡します (例: `"T_max=100"`)。
+* `--lr_decay_steps`: 学習率が減衰するステップ数を設定します。
+* `--lr_scheduler_timescale`: 逆平方根スケジューラのタイムスケール。
+* `--lr_scheduler_min_lr_ratio`: 特定のスケジューラについて、初期学習率に対する最小学習率の比率を設定します。
+
+### 1.15. LoRAの差分学習
+
+既存の学習済みLoRAをベースモデルにマージしてから、新たな学習を開始する手法です。既存LoRAのファインチューニングや、差分を学習させたい場合に有効です。
+
+* `--base_weights`: 学習開始前にベースモデルにマージするLoRAの重みファイルを1つ以上指定します。
+* `--base_weights_multiplier`: `--base_weights`で指定したLoRAの重みの倍率。複数指定も可能です。
+
+### 1.16. その他のオプション
+
+* `--tokenizer_cache_dir`: オフラインでの学習に便利なように、tokenizerをキャッシュするディレクトリを指定します。
+* `--scale_weight_norms`: LoRAモジュールの重みのノルムをスケーリングします。重みの大きさを制御することで過学習を防ぐ助けになります。`1.0`が良い出発点です。
+* `--disable_mmap_load_safetensors`: `.safetensors`ファイルのメモリマップドローディングを無効にします。WSLなどの一部環境でモデルの読み込みを高速化できます。
+
+## 2. その他のTips
+
+
+*   **VRAM使用量:** SDXL LoRA学習は多くのVRAMを必要とします。24GB VRAMでも設定によってはメモリ不足になることがあります。以下の設定でVRAM使用量を削減できます。
+    *   `--mixed_precision="bf16"` または `"fp16"` (必須級)
+    *   `--gradient_checkpointing` (強く推奨)
+    *   `--cache_latents` / `--cache_text_encoder_outputs` (効果大、制約あり)
+    *   `--optimizer_type="AdamW8bit"` または `"Adafactor"`
+    *   `--gradient_accumulation_steps` の値を増やす (バッチサイズを小さくする)
+    *   `--full_fp16` / `--full_bf16` (安定性に注意)
+    *   `--fp8_base` / `--fp8_base_unet` (実験的)
+    *   `--fused_backward_pass` (Adafactor限定、実験的)
+*   **学習率:** SDXL LoRAの適切な学習率はデータセットや`network_dim`/`alpha`に依存します。`1e-4` ~ `4e-5` (U-Net), `1e-5` ~ `2e-5` (Text Encoders) あたりから試すのが一般的です。
+*   **学習時間:** 高解像度データとSDXLモデルのサイズのため、学習には時間がかかります。キャッシュ機能や適切なハードウェアの利用が重要です。
+*   **トラブルシューティング:**
+    *   **NaN Loss:** 学習率が高すぎる、混合精度の設定が不適切 (`fp16`時の`--no_half_vae`未指定など)、データセットの問題などが考えられます。
+    *   **VRAM不足 (OOM):** 上記のVRAM削減策を試してください。
+    *   **学習が進まない:** 学習率が低すぎる、Optimizer/Schedulerの設定が不適切、データセットの問題などが考えられます。
+
+## 3. おわりに
+
+`sdxl_train_network.py` は非常に多くのオプションを提供しており、SDXL LoRA学習の様々な側面をカスタマイズできます。このドキュメントが、より高度な設定やチューニングを行う際の助けとなれば幸いです。
+
+不明な点や詳細については、各スクリプトの `--help` オプションや、リポジトリ内の他のドキュメント、実装コード自体を参照してください。
+
+</details>
+
+

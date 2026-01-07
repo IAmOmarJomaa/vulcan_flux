@@ -1,0 +1,3538 @@
+library\ipex\hijacks.py:
+import os
+from functools import wraps
+from contextlib import nullcontext
+import torch
+import numpy as np
+
+torch_version = float(torch.__version__[:3])
+current_xpu_device = f"xpu:{torch.xpu.current_device()}"
+device_supports_fp64 = torch.xpu.has_fp64_dtype() if hasattr(torch.xpu, "has_fp64_dtype") else torch.xpu.get_device_properties(current_xpu_device).has_fp64
+
+if os.environ.get('IPEX_FORCE_ATTENTION_SLICE', '0') == '0':
+    if (torch.xpu.get_device_properties(current_xpu_device).total_memory / 1024 / 1024 / 1024) > 4.1:
+        try:
+            x = torch.ones((33000,33000), dtype=torch.float32, device=current_xpu_device)
+            del x
+            torch.xpu.empty_cache()
+            use_dynamic_attention = False
+        except Exception:
+            use_dynamic_attention = True
+    else:
+        use_dynamic_attention = True
+else:
+    use_dynamic_attention = bool(os.environ.get('IPEX_FORCE_ATTENTION_SLICE', '0') == '1')
+
+# pylint: disable=protected-access, missing-function-docstring, line-too-long, unnecessary-lambda, no-else-return
+
+class DummyDataParallel(torch.nn.Module): # pylint: disable=missing-class-docstring, unused-argument, too-few-public-methods
+    def __new__(cls, module, device_ids=None, output_device=None, dim=0): # pylint: disable=unused-argument
+        if isinstance(device_ids, list) and len(device_ids) > 1:
+            print("IPEX backend doesn't support DataParallel on multiple XPU devices")
+        return module.to(f"xpu:{torch.xpu.current_device()}")
+
+def return_null_context(*args, **kwargs): # pylint: disable=unused-argument
+    return nullcontext()
+
+@property
+def is_cuda(self):
+    return self.device.type == "xpu" or self.device.type == "cuda"
+
+def check_device_type(device, device_type: str) -> bool:
+    if device is None or type(device) not in {str, int, torch.device}:
+        return False
+    else:
+        return bool(torch.device(device).type == device_type)
+
+def check_cuda(device) -> bool:
+    return bool(isinstance(device, int) or check_device_type(device, "cuda"))
+
+def return_xpu(device): # keep the device instance type, aka return string if the input is string
+    return f"xpu:{torch.xpu.current_device()}" if device is None else f"xpu:{device.split(':')[-1]}" if isinstance(device, str) and ":" in device else f"xpu:{device}" if isinstance(device, int) else torch.device(f"xpu:{device.index}" if device.index is not None else "xpu") if isinstance(device, torch.device) else "xpu"
+
+
+# Autocast
+original_autocast_init = torch.amp.autocast_mode.autocast.__init__
+@wraps(torch.amp.autocast_mode.autocast.__init__)
+def autocast_init(self, device_type=None, dtype=None, enabled=True, cache_enabled=None):
+    if device_type is None or check_cuda(device_type):
+        return original_autocast_init(self, device_type="xpu", dtype=dtype, enabled=enabled, cache_enabled=cache_enabled)
+    else:
+        return original_autocast_init(self, device_type=device_type, dtype=dtype, enabled=enabled, cache_enabled=cache_enabled)
+
+
+original_grad_scaler_init = torch.amp.grad_scaler.GradScaler.__init__
+@wraps(torch.amp.grad_scaler.GradScaler.__init__)
+def GradScaler_init(self, device: str = None, init_scale: float = 2.0**16, growth_factor: float = 2.0, backoff_factor: float = 0.5, growth_interval: int = 2000, enabled: bool = True):
+    if device is None or check_cuda(device):
+        return original_grad_scaler_init(self, device=return_xpu(device), init_scale=init_scale, growth_factor=growth_factor, backoff_factor=backoff_factor, growth_interval=growth_interval, enabled=enabled)
+    else:
+        return original_grad_scaler_init(self, device=device, init_scale=init_scale, growth_factor=growth_factor, backoff_factor=backoff_factor, growth_interval=growth_interval, enabled=enabled)
+
+
+original_is_autocast_enabled = torch.is_autocast_enabled
+@wraps(torch.is_autocast_enabled)
+def torch_is_autocast_enabled(device_type=None):
+    if device_type is None or check_cuda(device_type):
+        return original_is_autocast_enabled(return_xpu(device_type))
+    else:
+        return original_is_autocast_enabled(device_type)
+
+
+original_get_autocast_dtype = torch.get_autocast_dtype
+@wraps(torch.get_autocast_dtype)
+def torch_get_autocast_dtype(device_type=None):
+    if device_type is None or check_cuda(device_type) or check_device_type(device_type, "xpu"):
+        return torch.bfloat16
+    else:
+        return original_get_autocast_dtype(device_type)
+
+
+# Latent Antialias CPU Offload:
+# IPEX 2.5 and above has partial support but doesn't really work most of the time.
+original_interpolate = torch.nn.functional.interpolate
+@wraps(torch.nn.functional.interpolate)
+def interpolate(tensor, size=None, scale_factor=None, mode='nearest', align_corners=None, recompute_scale_factor=None, antialias=False): # pylint: disable=too-many-arguments
+    if mode in {'bicubic', 'bilinear'}:
+        return_device = tensor.device
+        return_dtype = tensor.dtype
+        return original_interpolate(tensor.to("cpu", dtype=torch.float32), size=size, scale_factor=scale_factor, mode=mode,
+        align_corners=align_corners, recompute_scale_factor=recompute_scale_factor, antialias=antialias).to(return_device, dtype=return_dtype)
+    else:
+        return original_interpolate(tensor, size=size, scale_factor=scale_factor, mode=mode,
+        align_corners=align_corners, recompute_scale_factor=recompute_scale_factor, antialias=antialias)
+
+
+# Diffusers Float64 (Alchemist GPUs doesn't support 64 bit):
+original_from_numpy = torch.from_numpy
+@wraps(torch.from_numpy)
+def from_numpy(ndarray):
+    if ndarray.dtype == float:
+        return original_from_numpy(ndarray.astype("float32"))
+    else:
+        return original_from_numpy(ndarray)
+
+original_as_tensor = torch.as_tensor
+@wraps(torch.as_tensor)
+def as_tensor(data, dtype=None, device=None):
+    if check_cuda(device):
+        device = return_xpu(device)
+    if isinstance(data, np.ndarray) and data.dtype == float and not check_device_type(device, "cpu"):
+        return original_as_tensor(data, dtype=torch.float32, device=device)
+    else:
+        return original_as_tensor(data, dtype=dtype, device=device)
+
+
+if not use_dynamic_attention:
+    original_scaled_dot_product_attention = torch.nn.functional.scaled_dot_product_attention
+else:
+    # 32 bit attention workarounds for Alchemist:
+    try:
+        from .attention import dynamic_scaled_dot_product_attention as original_scaled_dot_product_attention
+    except Exception: # pylint: disable=broad-exception-caught
+        original_scaled_dot_product_attention = torch.nn.functional.scaled_dot_product_attention
+
+@wraps(torch.nn.functional.scaled_dot_product_attention)
+def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, **kwargs):
+    if query.dtype != key.dtype:
+        key = key.to(dtype=query.dtype)
+    if query.dtype != value.dtype:
+        value = value.to(dtype=query.dtype)
+    if attn_mask is not None and query.dtype != attn_mask.dtype:
+        attn_mask = attn_mask.to(dtype=query.dtype)
+    return original_scaled_dot_product_attention(query, key, value, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, **kwargs)
+
+# Data Type Errors:
+original_torch_bmm = torch.bmm
+@wraps(torch.bmm)
+def torch_bmm(input, mat2, *, out=None):
+    if input.dtype != mat2.dtype:
+        mat2 = mat2.to(dtype=input.dtype)
+    return original_torch_bmm(input, mat2, out=out)
+
+# Diffusers FreeU
+original_fft_fftn = torch.fft.fftn
+@wraps(torch.fft.fftn)
+def fft_fftn(input, s=None, dim=None, norm=None, *, out=None):
+    return_dtype = input.dtype
+    return original_fft_fftn(input.to(dtype=torch.float32), s=s, dim=dim, norm=norm, out=out).to(dtype=return_dtype)
+
+# Diffusers FreeU
+original_fft_ifftn = torch.fft.ifftn
+@wraps(torch.fft.ifftn)
+def fft_ifftn(input, s=None, dim=None, norm=None, *, out=None):
+    return_dtype = input.dtype
+    return original_fft_ifftn(input.to(dtype=torch.float32), s=s, dim=dim, norm=norm, out=out).to(dtype=return_dtype)
+
+# A1111 FP16
+original_functional_group_norm = torch.nn.functional.group_norm
+@wraps(torch.nn.functional.group_norm)
+def functional_group_norm(input, num_groups, weight=None, bias=None, eps=1e-05):
+    if weight is not None and input.dtype != weight.data.dtype:
+        input = input.to(dtype=weight.data.dtype)
+    if bias is not None and weight is not None and bias.data.dtype != weight.data.dtype:
+        bias.data = bias.data.to(dtype=weight.data.dtype)
+    return original_functional_group_norm(input, num_groups, weight=weight, bias=bias, eps=eps)
+
+# A1111 BF16
+original_functional_layer_norm = torch.nn.functional.layer_norm
+@wraps(torch.nn.functional.layer_norm)
+def functional_layer_norm(input, normalized_shape, weight=None, bias=None, eps=1e-05):
+    if weight is not None and input.dtype != weight.data.dtype:
+        input = input.to(dtype=weight.data.dtype)
+    if bias is not None and weight is not None and bias.data.dtype != weight.data.dtype:
+        bias.data = bias.data.to(dtype=weight.data.dtype)
+    return original_functional_layer_norm(input, normalized_shape, weight=weight, bias=bias, eps=eps)
+
+# Training
+original_functional_linear = torch.nn.functional.linear
+@wraps(torch.nn.functional.linear)
+def functional_linear(input, weight, bias=None):
+    if input.dtype != weight.data.dtype:
+        input = input.to(dtype=weight.data.dtype)
+    if bias is not None and bias.data.dtype != weight.data.dtype:
+        bias.data = bias.data.to(dtype=weight.data.dtype)
+    return original_functional_linear(input, weight, bias=bias)
+
+original_functional_conv1d = torch.nn.functional.conv1d
+@wraps(torch.nn.functional.conv1d)
+def functional_conv1d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
+    if input.dtype != weight.data.dtype:
+        input = input.to(dtype=weight.data.dtype)
+    if bias is not None and bias.data.dtype != weight.data.dtype:
+        bias.data = bias.data.to(dtype=weight.data.dtype)
+    return original_functional_conv1d(input, weight, bias=bias, stride=stride, padding=padding, dilation=dilation, groups=groups)
+
+original_functional_conv2d = torch.nn.functional.conv2d
+@wraps(torch.nn.functional.conv2d)
+def functional_conv2d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
+    if input.dtype != weight.data.dtype:
+        input = input.to(dtype=weight.data.dtype)
+    if bias is not None and bias.data.dtype != weight.data.dtype:
+        bias.data = bias.data.to(dtype=weight.data.dtype)
+    return original_functional_conv2d(input, weight, bias=bias, stride=stride, padding=padding, dilation=dilation, groups=groups)
+
+# LTX Video
+original_functional_conv3d = torch.nn.functional.conv3d
+@wraps(torch.nn.functional.conv3d)
+def functional_conv3d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
+    if input.dtype != weight.data.dtype:
+        input = input.to(dtype=weight.data.dtype)
+    if bias is not None and bias.data.dtype != weight.data.dtype:
+        bias.data = bias.data.to(dtype=weight.data.dtype)
+    return original_functional_conv3d(input, weight, bias=bias, stride=stride, padding=padding, dilation=dilation, groups=groups)
+
+# SwinIR BF16:
+original_functional_pad = torch.nn.functional.pad
+@wraps(torch.nn.functional.pad)
+def functional_pad(input, pad, mode='constant', value=None):
+    if mode == 'reflect' and input.dtype == torch.bfloat16:
+        return original_functional_pad(input.to(torch.float32), pad, mode=mode, value=value).to(dtype=torch.bfloat16)
+    else:
+        return original_functional_pad(input, pad, mode=mode, value=value)
+
+
+original_torch_tensor = torch.tensor
+@wraps(torch.tensor)
+def torch_tensor(data, *args, dtype=None, device=None, **kwargs):
+    global device_supports_fp64
+    if check_cuda(device):
+        device = return_xpu(device)
+    if not device_supports_fp64:
+        if check_device_type(device, "xpu"):
+            if dtype == torch.float64:
+                dtype = torch.float32
+            elif dtype is None and (hasattr(data, "dtype") and (data.dtype == torch.float64 or data.dtype == float)):
+                dtype = torch.float32
+    return original_torch_tensor(data, *args, dtype=dtype, device=device, **kwargs)
+
+torch.Tensor.original_Tensor_to = torch.Tensor.to
+@wraps(torch.Tensor.to)
+def Tensor_to(self, device=None, *args, **kwargs):
+    if check_cuda(device):
+        return self.original_Tensor_to(return_xpu(device), *args, **kwargs)
+    else:
+        return self.original_Tensor_to(device, *args, **kwargs)
+
+original_Tensor_cuda = torch.Tensor.cuda
+@wraps(torch.Tensor.cuda)
+def Tensor_cuda(self, device=None, *args, **kwargs):
+    if device is None or check_cuda(device):
+        return self.to(return_xpu(device), *args, **kwargs)
+    else:
+        return original_Tensor_cuda(self, device, *args, **kwargs)
+
+original_Tensor_pin_memory = torch.Tensor.pin_memory
+@wraps(torch.Tensor.pin_memory)
+def Tensor_pin_memory(self, device=None, *args, **kwargs):
+    if device is None or check_cuda(device):
+        return original_Tensor_pin_memory(self, return_xpu(device), *args, **kwargs)
+    else:
+        return original_Tensor_pin_memory(self, device, *args, **kwargs)
+
+original_UntypedStorage_init = torch.UntypedStorage.__init__
+@wraps(torch.UntypedStorage.__init__)
+def UntypedStorage_init(*args, device=None, **kwargs):
+    if check_cuda(device):
+        return original_UntypedStorage_init(*args, device=return_xpu(device), **kwargs)
+    else:
+        return original_UntypedStorage_init(*args, device=device, **kwargs)
+
+if torch_version >= 2.4:
+    original_UntypedStorage_to = torch.UntypedStorage.to
+    @wraps(torch.UntypedStorage.to)
+    def UntypedStorage_to(self, *args, device=None, **kwargs):
+        if check_cuda(device):
+            return original_UntypedStorage_to(self, *args, device=return_xpu(device), **kwargs)
+        else:
+            return original_UntypedStorage_to(self, *args, device=device, **kwargs)
+
+    original_UntypedStorage_cuda = torch.UntypedStorage.cuda
+    @wraps(torch.UntypedStorage.cuda)
+    def UntypedStorage_cuda(self, device=None, non_blocking=False, **kwargs):
+        if device is None or check_cuda(device):
+            return self.to(device=return_xpu(device), non_blocking=non_blocking, **kwargs)
+        else:
+            return original_UntypedStorage_cuda(self, device=device, non_blocking=non_blocking, **kwargs)
+
+original_torch_empty = torch.empty
+@wraps(torch.empty)
+def torch_empty(*args, device=None, **kwargs):
+    if check_cuda(device):
+        return original_torch_empty(*args, device=return_xpu(device), **kwargs)
+    else:
+        return original_torch_empty(*args, device=device, **kwargs)
+
+original_torch_randn = torch.randn
+@wraps(torch.randn)
+def torch_randn(*args, device=None, dtype=None, **kwargs):
+    if dtype is bytes:
+        dtype = None
+    if check_cuda(device):
+        return original_torch_randn(*args, device=return_xpu(device), **kwargs)
+    else:
+        return original_torch_randn(*args, device=device, **kwargs)
+
+original_torch_ones = torch.ones
+@wraps(torch.ones)
+def torch_ones(*args, device=None, **kwargs):
+    if check_cuda(device):
+        return original_torch_ones(*args, device=return_xpu(device), **kwargs)
+    else:
+        return original_torch_ones(*args, device=device, **kwargs)
+
+original_torch_zeros = torch.zeros
+@wraps(torch.zeros)
+def torch_zeros(*args, device=None, **kwargs):
+    if check_cuda(device):
+        return original_torch_zeros(*args, device=return_xpu(device), **kwargs)
+    else:
+        return original_torch_zeros(*args, device=device, **kwargs)
+
+original_torch_full = torch.full
+@wraps(torch.full)
+def torch_full(*args, device=None, **kwargs):
+    if check_cuda(device):
+        return original_torch_full(*args, device=return_xpu(device), **kwargs)
+    else:
+        return original_torch_full(*args, device=device, **kwargs)
+
+original_torch_linspace = torch.linspace
+@wraps(torch.linspace)
+def torch_linspace(*args, device=None, **kwargs):
+    if check_cuda(device):
+        return original_torch_linspace(*args, device=return_xpu(device), **kwargs)
+    else:
+        return original_torch_linspace(*args, device=device, **kwargs)
+
+original_torch_eye = torch.eye
+@wraps(torch.eye)
+def torch_eye(*args, device=None, **kwargs):
+    if check_cuda(device):
+        return original_torch_eye(*args, device=return_xpu(device), **kwargs)
+    else:
+        return original_torch_eye(*args, device=device, **kwargs)
+
+original_torch_load = torch.load
+@wraps(torch.load)
+def torch_load(f, map_location=None, *args, **kwargs):
+    if map_location is None or check_cuda(map_location):
+        return original_torch_load(f, *args, map_location=return_xpu(map_location), **kwargs)
+    else:
+        return original_torch_load(f, *args, map_location=map_location, **kwargs)
+
+@wraps(torch.cuda.synchronize)
+def torch_cuda_synchronize(device=None):
+    if check_cuda(device):
+        return torch.xpu.synchronize(return_xpu(device))
+    else:
+        return torch.xpu.synchronize(device)
+
+@wraps(torch.cuda.device)
+def torch_cuda_device(device):
+    if check_cuda(device):
+        return torch.xpu.device(return_xpu(device))
+    else:
+        return torch.xpu.device(device)
+
+@wraps(torch.cuda.set_device)
+def torch_cuda_set_device(device):
+    if check_cuda(device):
+        torch.xpu.set_device(return_xpu(device))
+    else:
+        torch.xpu.set_device(device)
+
+# torch.Generator has to be a class for isinstance checks
+original_torch_Generator = torch.Generator
+class torch_Generator(original_torch_Generator):
+    def __new__(self, device=None):
+        # can't hijack __init__ because of C override so use return super().__new__
+        if check_cuda(device):
+            return super().__new__(self, return_xpu(device))
+        else:
+            return super().__new__(self, device)
+
+
+# Hijack Functions:
+def ipex_hijacks():
+    global device_supports_fp64
+    if torch_version >= 2.4:
+        torch.UntypedStorage.cuda = UntypedStorage_cuda
+        torch.UntypedStorage.to = UntypedStorage_to
+    torch.tensor = torch_tensor
+    torch.Tensor.to = Tensor_to
+    torch.Tensor.cuda = Tensor_cuda
+    torch.Tensor.pin_memory = Tensor_pin_memory
+    torch.UntypedStorage.__init__ = UntypedStorage_init
+    torch.empty = torch_empty
+    torch.randn = torch_randn
+    torch.ones = torch_ones
+    torch.zeros = torch_zeros
+    torch.full = torch_full
+    torch.linspace = torch_linspace
+    torch.eye = torch_eye
+    torch.load = torch_load
+    torch.cuda.synchronize = torch_cuda_synchronize
+    torch.cuda.device = torch_cuda_device
+    torch.cuda.set_device = torch_cuda_set_device
+
+    torch.Generator = torch_Generator
+    torch._C.Generator = torch_Generator
+
+    torch.backends.cuda.sdp_kernel = return_null_context
+    torch.nn.DataParallel = DummyDataParallel
+    torch.UntypedStorage.is_cuda = is_cuda
+    torch.amp.autocast_mode.autocast.__init__ = autocast_init
+
+    torch.nn.functional.interpolate = interpolate
+    torch.nn.functional.scaled_dot_product_attention = scaled_dot_product_attention
+    torch.nn.functional.group_norm = functional_group_norm
+    torch.nn.functional.layer_norm = functional_layer_norm
+    torch.nn.functional.linear = functional_linear
+    torch.nn.functional.conv1d = functional_conv1d
+    torch.nn.functional.conv2d = functional_conv2d
+    torch.nn.functional.conv3d = functional_conv3d
+    torch.nn.functional.pad = functional_pad
+
+    torch.bmm = torch_bmm
+    torch.fft.fftn = fft_fftn
+    torch.fft.ifftn = fft_ifftn
+    if not device_supports_fp64:
+        torch.from_numpy = from_numpy
+        torch.as_tensor = as_tensor
+
+    # AMP:
+    torch.amp.grad_scaler.GradScaler.__init__ = GradScaler_init
+    torch.is_autocast_enabled = torch_is_autocast_enabled
+    torch.get_autocast_gpu_dtype = torch_get_autocast_dtype
+    torch.get_autocast_dtype = torch_get_autocast_dtype
+
+    if hasattr(torch.xpu, "amp"):
+        if not hasattr(torch.xpu.amp, "custom_fwd"):
+            torch.xpu.amp.custom_fwd = torch.cuda.amp.custom_fwd
+            torch.xpu.amp.custom_bwd = torch.cuda.amp.custom_bwd
+        if not hasattr(torch.xpu.amp, "GradScaler"):
+            torch.xpu.amp.GradScaler = torch.amp.grad_scaler.GradScaler
+        torch.cuda.amp = torch.xpu.amp
+    else:
+        if not hasattr(torch.amp, "custom_fwd"):
+            torch.amp.custom_fwd = torch.cuda.amp.custom_fwd
+            torch.amp.custom_bwd = torch.cuda.amp.custom_bwd
+        torch.cuda.amp = torch.amp
+
+    if not hasattr(torch.cuda.amp, "common"):
+        torch.cuda.amp.common = nullcontext()
+    torch.cuda.amp.common.amp_definitely_not_available = lambda: False
+
+    return device_supports_fp64
+
+
+library\jpeg_xl_util.py:
+# Modified from https://github.com/Fraetor/jxl_decode Original license: MIT
+# Added partial read support for up to 200x speedup
+
+import os
+from typing import List, Tuple
+
+class JXLBitstream:
+    """
+    A stream of bits with methods for easy handling.
+    """
+
+    def __init__(self, file, offset: int = 0, offsets: List[List[int]] = None):
+        self.shift = 0
+        self.bitstream = bytearray()
+        self.file = file
+        self.offset = offset
+        self.offsets = offsets
+        if self.offsets:
+            self.offset = self.offsets[0][1]
+            self.previous_data_len = 0
+            self.index = 0
+        self.file.seek(self.offset)
+
+    def get_bits(self, length: int = 1) -> int:
+        if self.offsets and self.shift + length > self.previous_data_len + self.offsets[self.index][2]:
+            self.partial_to_read_length = length
+            if self.shift < self.previous_data_len + self.offsets[self.index][2]:
+                self.partial_read(0, length)
+            self.bitstream.extend(self.file.read(self.partial_to_read_length))
+        else:
+            self.bitstream.extend(self.file.read(length))
+        bitmask = 2**length - 1
+        bits = (int.from_bytes(self.bitstream, "little") >> self.shift) & bitmask
+        self.shift += length
+        return bits
+
+    def partial_read(self, current_length: int, length: int) -> None:
+        self.previous_data_len += self.offsets[self.index][2]
+        to_read_length = self.previous_data_len - (self.shift + current_length)
+        self.bitstream.extend(self.file.read(to_read_length))
+        current_length += to_read_length
+        self.partial_to_read_length -= to_read_length
+        self.index += 1
+        self.file.seek(self.offsets[self.index][1])
+        if self.shift + length > self.previous_data_len + self.offsets[self.index][2]:
+            self.partial_read(current_length, length)
+
+
+def decode_codestream(file, offset: int = 0, offsets: List[List[int]] = None) -> Tuple[int,int]:
+    """
+    Decodes the actual codestream.
+    JXL codestream specification: http://www-internal/2022/18181-1
+    """
+
+    # Convert codestream to int within an object to get some handy methods.
+    codestream = JXLBitstream(file, offset=offset, offsets=offsets)
+
+    # Skip signature
+    codestream.get_bits(16)
+
+    # SizeHeader
+    div8 = codestream.get_bits(1)
+    if div8:
+        height = 8 * (1 + codestream.get_bits(5))
+    else:
+        distribution = codestream.get_bits(2)
+        match distribution:
+            case 0:
+                height = 1 + codestream.get_bits(9)
+            case 1:
+                height = 1 + codestream.get_bits(13)
+            case 2:
+                height = 1 + codestream.get_bits(18)
+            case 3:
+                height = 1 + codestream.get_bits(30)
+    ratio = codestream.get_bits(3)
+    if div8 and not ratio:
+        width = 8 * (1 + codestream.get_bits(5))
+    elif not ratio:
+        distribution = codestream.get_bits(2)
+        match distribution:
+            case 0:
+                width = 1 + codestream.get_bits(9)
+            case 1:
+                width = 1 + codestream.get_bits(13)
+            case 2:
+                width = 1 + codestream.get_bits(18)
+            case 3:
+                width = 1 + codestream.get_bits(30)
+    else:
+        match ratio:
+            case 1:
+                width = height
+            case 2:
+                width = (height * 12) // 10
+            case 3:
+                width = (height * 4) // 3
+            case 4:
+                width = (height * 3) // 2
+            case 5:
+                width = (height * 16) // 9
+            case 6:
+                width = (height * 5) // 4
+            case 7:
+                width = (height * 2) // 1
+    return width, height
+
+
+def decode_container(file) -> Tuple[int,int]:
+    """
+    Parses the ISOBMFF container, extracts the codestream, and decodes it.
+    JXL container specification: http://www-internal/2022/18181-2
+    """
+
+    def parse_box(file, file_start: int) -> dict:
+        file.seek(file_start)
+        LBox = int.from_bytes(file.read(4), "big")
+        XLBox = None
+        if 1 < LBox <= 8:
+            raise ValueError(f"Invalid LBox at byte {file_start}.")
+        if LBox == 1:
+            file.seek(file_start + 8)
+            XLBox = int.from_bytes(file.read(8), "big")
+            if XLBox <= 16:
+                raise ValueError(f"Invalid XLBox at byte {file_start}.")
+        if XLBox:
+            header_length = 16
+            box_length = XLBox
+        else:
+            header_length = 8
+            if LBox == 0:
+                box_length = os.fstat(file.fileno()).st_size - file_start
+            else:
+                box_length = LBox
+        file.seek(file_start + 4)
+        box_type = file.read(4)
+        file.seek(file_start)
+        return {
+            "length": box_length,
+            "type": box_type,
+            "offset": header_length,
+        }
+
+    file.seek(0)
+    # Reject files missing required boxes. These two boxes are required to be at
+    # the start and contain no values, so we can manually check there presence.
+    # Signature box. (Redundant as has already been checked.)
+    if file.read(12) != bytes.fromhex("0000000C 4A584C20 0D0A870A"):
+        raise ValueError("Invalid signature box.")
+    # File Type box.
+    if file.read(20) != bytes.fromhex(
+        "00000014 66747970 6A786C20 00000000 6A786C20"
+    ):
+        raise ValueError("Invalid file type box.")
+
+    offset = 0
+    offsets = []
+    data_offset_not_found = True
+    container_pointer = 32
+    file_size = os.fstat(file.fileno()).st_size
+    while data_offset_not_found:
+        box = parse_box(file, container_pointer)
+        match box["type"]:
+            case b"jxlc":
+                offset = container_pointer + box["offset"]
+                data_offset_not_found = False
+            case b"jxlp":
+                file.seek(container_pointer + box["offset"])
+                index = int.from_bytes(file.read(4), "big")
+                offsets.append([index, container_pointer + box["offset"] + 4, box["length"] - box["offset"] - 4])
+        container_pointer += box["length"]
+        if container_pointer >= file_size:
+            data_offset_not_found = False
+
+    if offsets:
+        offsets.sort(key=lambda i: i[0])
+    file.seek(0)
+
+    return decode_codestream(file, offset=offset, offsets=offsets)
+
+
+def get_jxl_size(path: str) -> Tuple[int,int]:
+    with open(path, "rb") as file:
+        if file.read(2) == bytes.fromhex("FF0A"):
+            return decode_codestream(file)
+        return decode_container(file)
+
+
+library\lora_utils.py:
+import os
+import re
+from typing import Dict, List, Optional, Union
+import torch
+from tqdm import tqdm
+from library.device_utils import synchronize_device
+from library.fp8_optimization_utils import load_safetensors_with_fp8_optimization
+from library.safetensors_utils import MemoryEfficientSafeOpen
+from library.utils import setup_logging
+
+setup_logging()
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+def filter_lora_state_dict(
+    weights_sd: Dict[str, torch.Tensor],
+    include_pattern: Optional[str] = None,
+    exclude_pattern: Optional[str] = None,
+) -> Dict[str, torch.Tensor]:
+    # apply include/exclude patterns
+    original_key_count = len(weights_sd.keys())
+    if include_pattern is not None:
+        regex_include = re.compile(include_pattern)
+        weights_sd = {k: v for k, v in weights_sd.items() if regex_include.search(k)}
+        logger.info(f"Filtered keys with include pattern {include_pattern}: {original_key_count} -> {len(weights_sd.keys())}")
+
+    if exclude_pattern is not None:
+        original_key_count_ex = len(weights_sd.keys())
+        regex_exclude = re.compile(exclude_pattern)
+        weights_sd = {k: v for k, v in weights_sd.items() if not regex_exclude.search(k)}
+        logger.info(f"Filtered keys with exclude pattern {exclude_pattern}: {original_key_count_ex} -> {len(weights_sd.keys())}")
+
+    if len(weights_sd) != original_key_count:
+        remaining_keys = list(set([k.split(".", 1)[0] for k in weights_sd.keys()]))
+        remaining_keys.sort()
+        logger.info(f"Remaining LoRA modules after filtering: {remaining_keys}")
+        if len(weights_sd) == 0:
+            logger.warning("No keys left after filtering.")
+
+    return weights_sd
+
+
+def load_safetensors_with_lora_and_fp8(
+    model_files: Union[str, List[str]],
+    lora_weights_list: Optional[Dict[str, torch.Tensor]],
+    lora_multipliers: Optional[List[float]],
+    fp8_optimization: bool,
+    calc_device: torch.device,
+    move_to_device: bool = False,
+    dit_weight_dtype: Optional[torch.dtype] = None,
+    target_keys: Optional[List[str]] = None,
+    exclude_keys: Optional[List[str]] = None,
+) -> dict[str, torch.Tensor]:
+    """
+    Merge LoRA weights into the state dict of a model with fp8 optimization if needed.
+
+    Args:
+        model_files (Union[str, List[str]]): Path to the model file or list of paths. If the path matches a pattern like `00001-of-00004`, it will load all files with the same prefix.
+        lora_weights_list (Optional[Dict[str, torch.Tensor]]): Dictionary of LoRA weight tensors to load.
+        lora_multipliers (Optional[List[float]]): List of multipliers for LoRA weights.
+        fp8_optimization (bool): Whether to apply FP8 optimization.
+        calc_device (torch.device): Device to calculate on.
+        move_to_device (bool): Whether to move tensors to the calculation device after loading.
+        target_keys (Optional[List[str]]): Keys to target for optimization.
+        exclude_keys (Optional[List[str]]): Keys to exclude from optimization.
+    """
+
+    # if the file name ends with 00001-of-00004 etc, we need to load the files with the same prefix
+    if isinstance(model_files, str):
+        model_files = [model_files]
+
+    extended_model_files = []
+    for model_file in model_files:
+        basename = os.path.basename(model_file)
+        match = re.match(r"^(.*?)(\d+)-of-(\d+)\.safetensors$", basename)
+        if match:
+            prefix = basename[: match.start(2)]
+            count = int(match.group(3))
+            state_dict = {}
+            for i in range(count):
+                filename = f"{prefix}{i + 1:05d}-of-{count:05d}.safetensors"
+                filepath = os.path.join(os.path.dirname(model_file), filename)
+                if os.path.exists(filepath):
+                    extended_model_files.append(filepath)
+                else:
+                    raise FileNotFoundError(f"File {filepath} not found")
+        else:
+            extended_model_files.append(model_file)
+    model_files = extended_model_files
+    logger.info(f"Loading model files: {model_files}")
+
+    # load LoRA weights
+    weight_hook = None
+    if lora_weights_list is None or len(lora_weights_list) == 0:
+        lora_weights_list = []
+        lora_multipliers = []
+        list_of_lora_weight_keys = []
+    else:
+        list_of_lora_weight_keys = []
+        for lora_sd in lora_weights_list:
+            lora_weight_keys = set(lora_sd.keys())
+            list_of_lora_weight_keys.append(lora_weight_keys)
+
+        if lora_multipliers is None:
+            lora_multipliers = [1.0] * len(lora_weights_list)
+        while len(lora_multipliers) < len(lora_weights_list):
+            lora_multipliers.append(1.0)
+        if len(lora_multipliers) > len(lora_weights_list):
+            lora_multipliers = lora_multipliers[: len(lora_weights_list)]
+
+        # Merge LoRA weights into the state dict
+        logger.info(f"Merging LoRA weights into state dict. multipliers: {lora_multipliers}")
+
+        # make hook for LoRA merging
+        def weight_hook_func(model_weight_key, model_weight, keep_on_calc_device=False):
+            nonlocal list_of_lora_weight_keys, lora_weights_list, lora_multipliers, calc_device
+
+            if not model_weight_key.endswith(".weight"):
+                return model_weight
+
+            original_device = model_weight.device
+            if original_device != calc_device:
+                model_weight = model_weight.to(calc_device)  # to make calculation faster
+
+            for lora_weight_keys, lora_sd, multiplier in zip(list_of_lora_weight_keys, lora_weights_list, lora_multipliers):
+                # check if this weight has LoRA weights
+                lora_name = model_weight_key.rsplit(".", 1)[0]  # remove trailing ".weight"
+                lora_name = "lora_unet_" + lora_name.replace(".", "_")
+                down_key = lora_name + ".lora_down.weight"
+                up_key = lora_name + ".lora_up.weight"
+                alpha_key = lora_name + ".alpha"
+                if down_key not in lora_weight_keys or up_key not in lora_weight_keys:
+                    continue
+
+                # get LoRA weights
+                down_weight = lora_sd[down_key]
+                up_weight = lora_sd[up_key]
+
+                dim = down_weight.size()[0]
+                alpha = lora_sd.get(alpha_key, dim)
+                scale = alpha / dim
+
+                down_weight = down_weight.to(calc_device)
+                up_weight = up_weight.to(calc_device)
+
+                # W <- W + U * D
+                if len(model_weight.size()) == 2:
+                    # linear
+                    if len(up_weight.size()) == 4:  # use linear projection mismatch
+                        up_weight = up_weight.squeeze(3).squeeze(2)
+                        down_weight = down_weight.squeeze(3).squeeze(2)
+                    model_weight = model_weight + multiplier * (up_weight @ down_weight) * scale
+                elif down_weight.size()[2:4] == (1, 1):
+                    # conv2d 1x1
+                    model_weight = (
+                        model_weight
+                        + multiplier
+                        * (up_weight.squeeze(3).squeeze(2) @ down_weight.squeeze(3).squeeze(2)).unsqueeze(2).unsqueeze(3)
+                        * scale
+                    )
+                else:
+                    # conv2d 3x3
+                    conved = torch.nn.functional.conv2d(down_weight.permute(1, 0, 2, 3), up_weight).permute(1, 0, 2, 3)
+                    # logger.info(conved.size(), weight.size(), module.stride, module.padding)
+                    model_weight = model_weight + multiplier * conved * scale
+
+                # remove LoRA keys from set
+                lora_weight_keys.remove(down_key)
+                lora_weight_keys.remove(up_key)
+                if alpha_key in lora_weight_keys:
+                    lora_weight_keys.remove(alpha_key)
+
+            if not keep_on_calc_device and original_device != calc_device:
+                model_weight = model_weight.to(original_device)  # move back to original device
+            return model_weight
+
+        weight_hook = weight_hook_func
+
+    state_dict = load_safetensors_with_fp8_optimization_and_hook(
+        model_files,
+        fp8_optimization,
+        calc_device,
+        move_to_device,
+        dit_weight_dtype,
+        target_keys,
+        exclude_keys,
+        weight_hook=weight_hook,
+    )
+
+    for lora_weight_keys in list_of_lora_weight_keys:
+        # check if all LoRA keys are used
+        if len(lora_weight_keys) > 0:
+            # if there are still LoRA keys left, it means they are not used in the model
+            # this is a warning, not an error
+            logger.warning(f"Warning: not all LoRA keys are used: {', '.join(lora_weight_keys)}")
+
+    return state_dict
+
+
+def load_safetensors_with_fp8_optimization_and_hook(
+    model_files: list[str],
+    fp8_optimization: bool,
+    calc_device: torch.device,
+    move_to_device: bool = False,
+    dit_weight_dtype: Optional[torch.dtype] = None,
+    target_keys: Optional[List[str]] = None,
+    exclude_keys: Optional[List[str]] = None,
+    weight_hook: callable = None,
+) -> dict[str, torch.Tensor]:
+    """
+    Load state dict from safetensors files and merge LoRA weights into the state dict with fp8 optimization if needed.
+    """
+    if fp8_optimization:
+        logger.info(
+            f"Loading state dict with FP8 optimization. Dtype of weight: {dit_weight_dtype}, hook enabled: {weight_hook is not None}"
+        )
+        # dit_weight_dtype is not used because we use fp8 optimization
+        state_dict = load_safetensors_with_fp8_optimization(
+            model_files, calc_device, target_keys, exclude_keys, move_to_device=move_to_device, weight_hook=weight_hook
+        )
+    else:
+        logger.info(
+            f"Loading state dict without FP8 optimization. Dtype of weight: {dit_weight_dtype}, hook enabled: {weight_hook is not None}"
+        )
+        state_dict = {}
+        for model_file in model_files:
+            with MemoryEfficientSafeOpen(model_file) as f:
+                for key in tqdm(f.keys(), desc=f"Loading {os.path.basename(model_file)}", leave=False):
+                    if weight_hook is None and move_to_device:
+                        value = f.get_tensor(key, device=calc_device, dtype=dit_weight_dtype)
+                    else:
+                        value = f.get_tensor(key)  # we cannot directly load to device because get_tensor does non-blocking transfer
+                        if weight_hook is not None:
+                            value = weight_hook(key, value, keep_on_calc_device=move_to_device)
+                        if move_to_device:
+                            value = value.to(calc_device, dtype=dit_weight_dtype, non_blocking=True)
+                        elif dit_weight_dtype is not None:
+                            value = value.to(dit_weight_dtype)
+
+                    state_dict[key] = value
+        if move_to_device:
+            synchronize_device(calc_device)
+
+    return state_dict
+
+
+library\lpw_stable_diffusion.py:
+# copy from https://github.com/huggingface/diffusers/blob/main/examples/community/lpw_stable_diffusion.py
+# and modify to support SD2.x
+
+import inspect
+import re
+from typing import Callable, List, Optional, Union
+
+import numpy as np
+import PIL.Image
+import torch
+from packaging import version
+from transformers import CLIPFeatureExtractor, CLIPTextModel, CLIPTokenizer, CLIPVisionModelWithProjection
+
+import diffusers
+from diffusers import SchedulerMixin, StableDiffusionPipeline
+from diffusers.models import AutoencoderKL, UNet2DConditionModel
+from diffusers.pipelines.stable_diffusion import StableDiffusionPipelineOutput, StableDiffusionSafetyChecker
+from diffusers.utils import logging
+
+try:
+    from diffusers.utils import PIL_INTERPOLATION
+except ImportError:
+    if version.parse(version.parse(PIL.__version__).base_version) >= version.parse("9.1.0"):
+        PIL_INTERPOLATION = {
+            "linear": PIL.Image.Resampling.BILINEAR,
+            "bilinear": PIL.Image.Resampling.BILINEAR,
+            "bicubic": PIL.Image.Resampling.BICUBIC,
+            "lanczos": PIL.Image.Resampling.LANCZOS,
+            "nearest": PIL.Image.Resampling.NEAREST,
+        }
+    else:
+        PIL_INTERPOLATION = {
+            "linear": PIL.Image.LINEAR,
+            "bilinear": PIL.Image.BILINEAR,
+            "bicubic": PIL.Image.BICUBIC,
+            "lanczos": PIL.Image.LANCZOS,
+            "nearest": PIL.Image.NEAREST,
+        }
+# ------------------------------------------------------------------------------
+
+logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+
+re_attention = re.compile(
+    r"""
+\\\(|
+\\\)|
+\\\[|
+\\]|
+\\\\|
+\\|
+\(|
+\[|
+:([+-]?[.\d]+)\)|
+\)|
+]|
+[^\\()\[\]:]+|
+:
+""",
+    re.X,
+)
+
+
+def parse_prompt_attention(text):
+    """
+    Parses a string with attention tokens and returns a list of pairs: text and its associated weight.
+    Accepted tokens are:
+      (abc) - increases attention to abc by a multiplier of 1.1
+      (abc:3.12) - increases attention to abc by a multiplier of 3.12
+      [abc] - decreases attention to abc by a multiplier of 1.1
+      \( - literal character '('
+      \[ - literal character '['
+      \) - literal character ')'
+      \] - literal character ']'
+      \\ - literal character '\'
+      anything else - just text
+    >>> parse_prompt_attention('normal text')
+    [['normal text', 1.0]]
+    >>> parse_prompt_attention('an (important) word')
+    [['an ', 1.0], ['important', 1.1], [' word', 1.0]]
+    >>> parse_prompt_attention('(unbalanced')
+    [['unbalanced', 1.1]]
+    >>> parse_prompt_attention('\(literal\]')
+    [['(literal]', 1.0]]
+    >>> parse_prompt_attention('(unnecessary)(parens)')
+    [['unnecessaryparens', 1.1]]
+    >>> parse_prompt_attention('a (((house:1.3)) [on] a (hill:0.5), sun, (((sky))).')
+    [['a ', 1.0],
+     ['house', 1.5730000000000004],
+     [' ', 1.1],
+     ['on', 1.0],
+     [' a ', 1.1],
+     ['hill', 0.55],
+     [', sun, ', 1.1],
+     ['sky', 1.4641000000000006],
+     ['.', 1.1]]
+    """
+
+    res = []
+    round_brackets = []
+    square_brackets = []
+
+    round_bracket_multiplier = 1.1
+    square_bracket_multiplier = 1 / 1.1
+
+    def multiply_range(start_position, multiplier):
+        for p in range(start_position, len(res)):
+            res[p][1] *= multiplier
+
+    for m in re_attention.finditer(text):
+        text = m.group(0)
+        weight = m.group(1)
+
+        if text.startswith("\\"):
+            res.append([text[1:], 1.0])
+        elif text == "(":
+            round_brackets.append(len(res))
+        elif text == "[":
+            square_brackets.append(len(res))
+        elif weight is not None and len(round_brackets) > 0:
+            multiply_range(round_brackets.pop(), float(weight))
+        elif text == ")" and len(round_brackets) > 0:
+            multiply_range(round_brackets.pop(), round_bracket_multiplier)
+        elif text == "]" and len(square_brackets) > 0:
+            multiply_range(square_brackets.pop(), square_bracket_multiplier)
+        else:
+            res.append([text, 1.0])
+
+    for pos in round_brackets:
+        multiply_range(pos, round_bracket_multiplier)
+
+    for pos in square_brackets:
+        multiply_range(pos, square_bracket_multiplier)
+
+    if len(res) == 0:
+        res = [["", 1.0]]
+
+    # merge runs of identical weights
+    i = 0
+    while i + 1 < len(res):
+        if res[i][1] == res[i + 1][1]:
+            res[i][0] += res[i + 1][0]
+            res.pop(i + 1)
+        else:
+            i += 1
+
+    return res
+
+
+def get_prompts_with_weights(pipe: StableDiffusionPipeline, prompt: List[str], max_length: int):
+    r"""
+    Tokenize a list of prompts and return its tokens with weights of each token.
+
+    No padding, starting or ending token is included.
+    """
+    tokens = []
+    weights = []
+    truncated = False
+    for text in prompt:
+        texts_and_weights = parse_prompt_attention(text)
+        text_token = []
+        text_weight = []
+        for word, weight in texts_and_weights:
+            # tokenize and discard the starting and the ending token
+            token = pipe.tokenizer(word).input_ids[1:-1]
+            text_token += token
+            # copy the weight by length of token
+            text_weight += [weight] * len(token)
+            # stop if the text is too long (longer than truncation limit)
+            if len(text_token) > max_length:
+                truncated = True
+                break
+        # truncate
+        if len(text_token) > max_length:
+            truncated = True
+            text_token = text_token[:max_length]
+            text_weight = text_weight[:max_length]
+        tokens.append(text_token)
+        weights.append(text_weight)
+    if truncated:
+        logger.warning("Prompt was truncated. Try to shorten the prompt or increase max_embeddings_multiples")
+    return tokens, weights
+
+
+def pad_tokens_and_weights(tokens, weights, max_length, bos, eos, no_boseos_middle=True, chunk_length=77):
+    r"""
+    Pad the tokens (with starting and ending tokens) and weights (with 1.0) to max_length.
+    """
+    max_embeddings_multiples = (max_length - 2) // (chunk_length - 2)
+    weights_length = max_length if no_boseos_middle else max_embeddings_multiples * chunk_length
+    for i in range(len(tokens)):
+        tokens[i] = [bos] + tokens[i] + [eos] * (max_length - 1 - len(tokens[i]))
+        if no_boseos_middle:
+            weights[i] = [1.0] + weights[i] + [1.0] * (max_length - 1 - len(weights[i]))
+        else:
+            w = []
+            if len(weights[i]) == 0:
+                w = [1.0] * weights_length
+            else:
+                for j in range(max_embeddings_multiples):
+                    w.append(1.0)  # weight for starting token in this chunk
+                    w += weights[i][j * (chunk_length - 2) : min(len(weights[i]), (j + 1) * (chunk_length - 2))]
+                    w.append(1.0)  # weight for ending token in this chunk
+                w += [1.0] * (weights_length - len(w))
+            weights[i] = w[:]
+
+    return tokens, weights
+
+
+def get_unweighted_text_embeddings(
+    pipe: StableDiffusionPipeline,
+    text_input: torch.Tensor,
+    chunk_length: int,
+    clip_skip: int,
+    eos: int,
+    pad: int,
+    no_boseos_middle: Optional[bool] = True,
+):
+    """
+    When the length of tokens is a multiple of the capacity of the text encoder,
+    it should be split into chunks and sent to the text encoder individually.
+    """
+    max_embeddings_multiples = (text_input.shape[1] - 2) // (chunk_length - 2)
+    if max_embeddings_multiples > 1:
+        text_embeddings = []
+        for i in range(max_embeddings_multiples):
+            # extract the i-th chunk
+            text_input_chunk = text_input[:, i * (chunk_length - 2) : (i + 1) * (chunk_length - 2) + 2].clone()
+
+            # cover the head and the tail by the starting and the ending tokens
+            text_input_chunk[:, 0] = text_input[0, 0]
+            if pad == eos:  # v1
+                text_input_chunk[:, -1] = text_input[0, -1]
+            else:  # v2
+                for j in range(len(text_input_chunk)):
+                    if text_input_chunk[j, -1] != eos and text_input_chunk[j, -1] != pad:  # 最後に普通の文字がある
+                        text_input_chunk[j, -1] = eos
+                    if text_input_chunk[j, 1] == pad:  # BOSだけであとはPAD
+                        text_input_chunk[j, 1] = eos
+
+            if clip_skip is None or clip_skip == 1:
+                text_embedding = pipe.text_encoder(text_input_chunk)[0]
+            else:
+                enc_out = pipe.text_encoder(text_input_chunk, output_hidden_states=True, return_dict=True)
+                text_embedding = enc_out["hidden_states"][-clip_skip]
+                text_embedding = pipe.text_encoder.text_model.final_layer_norm(text_embedding)
+
+            if no_boseos_middle:
+                if i == 0:
+                    # discard the ending token
+                    text_embedding = text_embedding[:, :-1]
+                elif i == max_embeddings_multiples - 1:
+                    # discard the starting token
+                    text_embedding = text_embedding[:, 1:]
+                else:
+                    # discard both starting and ending tokens
+                    text_embedding = text_embedding[:, 1:-1]
+
+            text_embeddings.append(text_embedding)
+        text_embeddings = torch.concat(text_embeddings, axis=1)
+    else:
+        if clip_skip is None or clip_skip == 1:
+            text_embeddings = pipe.text_encoder(text_input)[0]
+        else:
+            enc_out = pipe.text_encoder(text_input, output_hidden_states=True, return_dict=True)
+            text_embeddings = enc_out["hidden_states"][-clip_skip]
+            text_embeddings = pipe.text_encoder.text_model.final_layer_norm(text_embeddings)
+    return text_embeddings
+
+
+def get_weighted_text_embeddings(
+    pipe: StableDiffusionPipeline,
+    prompt: Union[str, List[str]],
+    uncond_prompt: Optional[Union[str, List[str]]] = None,
+    max_embeddings_multiples: Optional[int] = 3,
+    no_boseos_middle: Optional[bool] = False,
+    skip_parsing: Optional[bool] = False,
+    skip_weighting: Optional[bool] = False,
+    clip_skip=None,
+):
+    r"""
+    Prompts can be assigned with local weights using brackets. For example,
+    prompt 'A (very beautiful) masterpiece' highlights the words 'very beautiful',
+    and the embedding tokens corresponding to the words get multiplied by a constant, 1.1.
+
+    Also, to regularize of the embedding, the weighted embedding would be scaled to preserve the original mean.
+
+    Args:
+        pipe (`StableDiffusionPipeline`):
+            Pipe to provide access to the tokenizer and the text encoder.
+        prompt (`str` or `List[str]`):
+            The prompt or prompts to guide the image generation.
+        uncond_prompt (`str` or `List[str]`):
+            The unconditional prompt or prompts for guide the image generation. If unconditional prompt
+            is provided, the embeddings of prompt and uncond_prompt are concatenated.
+        max_embeddings_multiples (`int`, *optional*, defaults to `3`):
+            The max multiple length of prompt embeddings compared to the max output length of text encoder.
+        no_boseos_middle (`bool`, *optional*, defaults to `False`):
+            If the length of text token is multiples of the capacity of text encoder, whether reserve the starting and
+            ending token in each of the chunk in the middle.
+        skip_parsing (`bool`, *optional*, defaults to `False`):
+            Skip the parsing of brackets.
+        skip_weighting (`bool`, *optional*, defaults to `False`):
+            Skip the weighting. When the parsing is skipped, it is forced True.
+    """
+    max_length = (pipe.tokenizer.model_max_length - 2) * max_embeddings_multiples + 2
+    if isinstance(prompt, str):
+        prompt = [prompt]
+
+    if not skip_parsing:
+        prompt_tokens, prompt_weights = get_prompts_with_weights(pipe, prompt, max_length - 2)
+        if uncond_prompt is not None:
+            if isinstance(uncond_prompt, str):
+                uncond_prompt = [uncond_prompt]
+            uncond_tokens, uncond_weights = get_prompts_with_weights(pipe, uncond_prompt, max_length - 2)
+    else:
+        prompt_tokens = [token[1:-1] for token in pipe.tokenizer(prompt, max_length=max_length, truncation=True).input_ids]
+        prompt_weights = [[1.0] * len(token) for token in prompt_tokens]
+        if uncond_prompt is not None:
+            if isinstance(uncond_prompt, str):
+                uncond_prompt = [uncond_prompt]
+            uncond_tokens = [
+                token[1:-1] for token in pipe.tokenizer(uncond_prompt, max_length=max_length, truncation=True).input_ids
+            ]
+            uncond_weights = [[1.0] * len(token) for token in uncond_tokens]
+
+    # round up the longest length of tokens to a multiple of (model_max_length - 2)
+    max_length = max([len(token) for token in prompt_tokens])
+    if uncond_prompt is not None:
+        max_length = max(max_length, max([len(token) for token in uncond_tokens]))
+
+    max_embeddings_multiples = min(
+        max_embeddings_multiples,
+        (max_length - 1) // (pipe.tokenizer.model_max_length - 2) + 1,
+    )
+    max_embeddings_multiples = max(1, max_embeddings_multiples)
+    max_length = (pipe.tokenizer.model_max_length - 2) * max_embeddings_multiples + 2
+
+    # pad the length of tokens and weights
+    bos = pipe.tokenizer.bos_token_id
+    eos = pipe.tokenizer.eos_token_id
+    pad = pipe.tokenizer.pad_token_id
+    prompt_tokens, prompt_weights = pad_tokens_and_weights(
+        prompt_tokens,
+        prompt_weights,
+        max_length,
+        bos,
+        eos,
+        no_boseos_middle=no_boseos_middle,
+        chunk_length=pipe.tokenizer.model_max_length,
+    )
+    prompt_tokens = torch.tensor(prompt_tokens, dtype=torch.long, device=pipe.device)
+    if uncond_prompt is not None:
+        uncond_tokens, uncond_weights = pad_tokens_and_weights(
+            uncond_tokens,
+            uncond_weights,
+            max_length,
+            bos,
+            eos,
+            no_boseos_middle=no_boseos_middle,
+            chunk_length=pipe.tokenizer.model_max_length,
+        )
+        uncond_tokens = torch.tensor(uncond_tokens, dtype=torch.long, device=pipe.device)
+
+    # get the embeddings
+    text_embeddings = get_unweighted_text_embeddings(
+        pipe,
+        prompt_tokens,
+        pipe.tokenizer.model_max_length,
+        clip_skip,
+        eos,
+        pad,
+        no_boseos_middle=no_boseos_middle,
+    )
+    prompt_weights = torch.tensor(prompt_weights, dtype=text_embeddings.dtype, device=pipe.device)
+    if uncond_prompt is not None:
+        uncond_embeddings = get_unweighted_text_embeddings(
+            pipe,
+            uncond_tokens,
+            pipe.tokenizer.model_max_length,
+            clip_skip,
+            eos,
+            pad,
+            no_boseos_middle=no_boseos_middle,
+        )
+        uncond_weights = torch.tensor(uncond_weights, dtype=uncond_embeddings.dtype, device=pipe.device)
+
+    # assign weights to the prompts and normalize in the sense of mean
+    # TODO: should we normalize by chunk or in a whole (current implementation)?
+    if (not skip_parsing) and (not skip_weighting):
+        previous_mean = text_embeddings.float().mean(axis=[-2, -1]).to(text_embeddings.dtype)
+        text_embeddings *= prompt_weights.unsqueeze(-1)
+        current_mean = text_embeddings.float().mean(axis=[-2, -1]).to(text_embeddings.dtype)
+        text_embeddings *= (previous_mean / current_mean).unsqueeze(-1).unsqueeze(-1)
+        if uncond_prompt is not None:
+            previous_mean = uncond_embeddings.float().mean(axis=[-2, -1]).to(uncond_embeddings.dtype)
+            uncond_embeddings *= uncond_weights.unsqueeze(-1)
+            current_mean = uncond_embeddings.float().mean(axis=[-2, -1]).to(uncond_embeddings.dtype)
+            uncond_embeddings *= (previous_mean / current_mean).unsqueeze(-1).unsqueeze(-1)
+
+    if uncond_prompt is not None:
+        return text_embeddings, uncond_embeddings
+    return text_embeddings, None
+
+
+def preprocess_image(image):
+    w, h = image.size
+    w, h = map(lambda x: x - x % 32, (w, h))  # resize to integer multiple of 32
+    image = image.resize((w, h), resample=PIL_INTERPOLATION["lanczos"])
+    image = np.array(image).astype(np.float32) / 255.0
+    image = image[None].transpose(0, 3, 1, 2)
+    image = torch.from_numpy(image)
+    return 2.0 * image - 1.0
+
+
+def preprocess_mask(mask, scale_factor=8):
+    mask = mask.convert("L")
+    w, h = mask.size
+    w, h = map(lambda x: x - x % 32, (w, h))  # resize to integer multiple of 32
+    mask = mask.resize((w // scale_factor, h // scale_factor), resample=PIL_INTERPOLATION["nearest"])
+    mask = np.array(mask).astype(np.float32) / 255.0
+    mask = np.tile(mask, (4, 1, 1))
+    mask = mask[None].transpose(0, 1, 2, 3)  # what does this step do?
+    mask = 1 - mask  # repaint white, keep black
+    mask = torch.from_numpy(mask)
+    return mask
+
+
+def prepare_controlnet_image(
+    image: PIL.Image.Image,
+    width: int,
+    height: int,
+    batch_size: int,
+    num_images_per_prompt: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    do_classifier_free_guidance: bool = False,
+    guess_mode: bool = False,
+):
+    if not isinstance(image, torch.Tensor):
+        if isinstance(image, PIL.Image.Image):
+            image = [image]
+
+        if isinstance(image[0], PIL.Image.Image):
+            images = []
+
+            for image_ in image:
+                image_ = image_.convert("RGB")
+                image_ = image_.resize((width, height), resample=PIL_INTERPOLATION["lanczos"])
+                image_ = np.array(image_)
+                image_ = image_[None, :]
+                images.append(image_)
+
+            image = images
+
+            image = np.concatenate(image, axis=0)
+            image = np.array(image).astype(np.float32) / 255.0
+            image = image.transpose(0, 3, 1, 2)
+            image = torch.from_numpy(image)
+        elif isinstance(image[0], torch.Tensor):
+            image = torch.cat(image, dim=0)
+
+    image_batch_size = image.shape[0]
+
+    if image_batch_size == 1:
+        repeat_by = batch_size
+    else:
+        # image batch size is the same as prompt batch size
+        repeat_by = num_images_per_prompt
+
+    image = image.repeat_interleave(repeat_by, dim=0)
+
+    image = image.to(device=device, dtype=dtype)
+
+    if do_classifier_free_guidance and not guess_mode:
+        image = torch.cat([image] * 2)
+
+    return image
+
+
+class StableDiffusionLongPromptWeightingPipeline(StableDiffusionPipeline):
+    r"""
+    Pipeline for text-to-image generation using Stable Diffusion without tokens length limit, and support parsing
+    weighting in prompt.
+
+    This model inherits from [`DiffusionPipeline`]. Check the superclass documentation for the generic methods the
+    library implements for all the pipelines (such as downloading or saving, running on a particular device, etc.)
+
+    Args:
+        vae ([`AutoencoderKL`]):
+            Variational Auto-Encoder (VAE) Model to encode and decode images to and from latent representations.
+        text_encoder ([`CLIPTextModel`]):
+            Frozen text-encoder. Stable Diffusion uses the text portion of
+            [CLIP](https://huggingface.co/docs/transformers/model_doc/clip#transformers.CLIPTextModel), specifically
+            the [clip-vit-large-patch14](https://huggingface.co/openai/clip-vit-large-patch14) variant.
+        tokenizer (`CLIPTokenizer`):
+            Tokenizer of class
+            [CLIPTokenizer](https://huggingface.co/docs/transformers/v4.21.0/en/model_doc/clip#transformers.CLIPTokenizer).
+        unet ([`UNet2DConditionModel`]): Conditional U-Net architecture to denoise the encoded image latents.
+        scheduler ([`SchedulerMixin`]):
+            A scheduler to be used in combination with `unet` to denoise the encoded image latents. Can be one of
+            [`DDIMScheduler`], [`LMSDiscreteScheduler`], or [`PNDMScheduler`].
+        safety_checker ([`StableDiffusionSafetyChecker`]):
+            Classification module that estimates whether generated images could be considered offensive or harmful.
+            Please, refer to the [model card](https://huggingface.co/CompVis/stable-diffusion-v1-4) for details.
+        feature_extractor ([`CLIPFeatureExtractor`]):
+            Model that extracts features from generated images to be used as inputs for the `safety_checker`.
+    """
+
+    # if version.parse(version.parse(diffusers.__version__).base_version) >= version.parse("0.9.0"):
+
+    def __init__(
+        self,
+        vae: AutoencoderKL,
+        text_encoder: CLIPTextModel,
+        tokenizer: CLIPTokenizer,
+        unet: UNet2DConditionModel,
+        scheduler: SchedulerMixin,
+        # clip_skip: int,
+        safety_checker: StableDiffusionSafetyChecker,
+        feature_extractor: CLIPFeatureExtractor,
+        requires_safety_checker: bool = True,
+        image_encoder: CLIPVisionModelWithProjection = None,
+        clip_skip: int = 1,
+    ):
+        super().__init__(
+            vae=vae,
+            text_encoder=text_encoder,
+            tokenizer=tokenizer,
+            unet=unet,
+            scheduler=scheduler,
+            safety_checker=safety_checker,
+            feature_extractor=feature_extractor,
+            requires_safety_checker=requires_safety_checker,
+            image_encoder=image_encoder,
+        )
+        self.custom_clip_skip = clip_skip
+        self.__init__additional__()
+
+    def __init__additional__(self):
+        if not hasattr(self, "vae_scale_factor"):
+            setattr(self, "vae_scale_factor", 2 ** (len(self.vae.config.block_out_channels) - 1))
+
+    @property
+    def _execution_device(self):
+        r"""
+        Returns the device on which the pipeline's models will be executed. After calling
+        `pipeline.enable_sequential_cpu_offload()` the execution device can only be inferred from Accelerate's module
+        hooks.
+        """
+        if self.device != torch.device("meta") or not hasattr(self.unet, "_hf_hook"):
+            return self.device
+        for module in self.unet.modules():
+            if (
+                hasattr(module, "_hf_hook")
+                and hasattr(module._hf_hook, "execution_device")
+                and module._hf_hook.execution_device is not None
+            ):
+                return torch.device(module._hf_hook.execution_device)
+        return self.device
+
+    def _encode_prompt(
+        self,
+        prompt,
+        device,
+        num_images_per_prompt,
+        do_classifier_free_guidance,
+        negative_prompt,
+        max_embeddings_multiples,
+    ):
+        r"""
+        Encodes the prompt into text encoder hidden states.
+
+        Args:
+            prompt (`str` or `list(int)`):
+                prompt to be encoded
+            device: (`torch.device`):
+                torch device
+            num_images_per_prompt (`int`):
+                number of images that should be generated per prompt
+            do_classifier_free_guidance (`bool`):
+                whether to use classifier free guidance or not
+            negative_prompt (`str` or `List[str]`):
+                The prompt or prompts not to guide the image generation. Ignored when not using guidance (i.e., ignored
+                if `guidance_scale` is less than `1`).
+            max_embeddings_multiples (`int`, *optional*, defaults to `3`):
+                The max multiple length of prompt embeddings compared to the max output length of text encoder.
+        """
+        batch_size = len(prompt) if isinstance(prompt, list) else 1
+
+        if negative_prompt is None:
+            negative_prompt = [""] * batch_size
+        elif isinstance(negative_prompt, str):
+            negative_prompt = [negative_prompt] * batch_size
+        if batch_size != len(negative_prompt):
+            raise ValueError(
+                f"`negative_prompt`: {negative_prompt} has batch size {len(negative_prompt)}, but `prompt`:"
+                f" {prompt} has batch size {batch_size}. Please make sure that passed `negative_prompt` matches"
+                " the batch size of `prompt`."
+            )
+
+        text_embeddings, uncond_embeddings = get_weighted_text_embeddings(
+            pipe=self,
+            prompt=prompt,
+            uncond_prompt=negative_prompt if do_classifier_free_guidance else None,
+            max_embeddings_multiples=max_embeddings_multiples,
+            clip_skip=self.custom_clip_skip,
+        )
+        bs_embed, seq_len, _ = text_embeddings.shape
+        text_embeddings = text_embeddings.repeat(1, num_images_per_prompt, 1)
+        text_embeddings = text_embeddings.view(bs_embed * num_images_per_prompt, seq_len, -1)
+
+        if do_classifier_free_guidance:
+            bs_embed, seq_len, _ = uncond_embeddings.shape
+            uncond_embeddings = uncond_embeddings.repeat(1, num_images_per_prompt, 1)
+            uncond_embeddings = uncond_embeddings.view(bs_embed * num_images_per_prompt, seq_len, -1)
+            text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
+
+        return text_embeddings
+
+    def check_inputs(self, prompt, height, width, strength, callback_steps):
+        if not isinstance(prompt, str) and not isinstance(prompt, list):
+            raise ValueError(f"`prompt` has to be of type `str` or `list` but is {type(prompt)}")
+
+        if strength < 0 or strength > 1:
+            raise ValueError(f"The value of strength should in [0.0, 1.0] but is {strength}")
+
+        if height % 8 != 0 or width % 8 != 0:
+            logger.info(f'{height} {width}')
+            raise ValueError(f"`height` and `width` have to be divisible by 8 but are {height} and {width}.")
+
+        if (callback_steps is None) or (
+            callback_steps is not None and (not isinstance(callback_steps, int) or callback_steps <= 0)
+        ):
+            raise ValueError(
+                f"`callback_steps` has to be a positive integer but is {callback_steps} of type" f" {type(callback_steps)}."
+            )
+
+    def get_timesteps(self, num_inference_steps, strength, device, is_text2img):
+        if is_text2img:
+            return self.scheduler.timesteps.to(device), num_inference_steps
+        else:
+            # get the original timestep using init_timestep
+            offset = self.scheduler.config.get("steps_offset", 0)
+            init_timestep = int(num_inference_steps * strength) + offset
+            init_timestep = min(init_timestep, num_inference_steps)
+
+            t_start = max(num_inference_steps - init_timestep + offset, 0)
+            timesteps = self.scheduler.timesteps[t_start:].to(device)
+            return timesteps, num_inference_steps - t_start
+
+    def run_safety_checker(self, image, device, dtype):
+        if self.safety_checker is not None:
+            safety_checker_input = self.feature_extractor(self.numpy_to_pil(image), return_tensors="pt").to(device)
+            image, has_nsfw_concept = self.safety_checker(images=image, clip_input=safety_checker_input.pixel_values.to(dtype))
+        else:
+            has_nsfw_concept = None
+        return image, has_nsfw_concept
+
+    def decode_latents(self, latents):
+        latents = 1 / 0.18215 * latents
+        image = self.vae.decode(latents).sample
+        image = (image / 2 + 0.5).clamp(0, 1)
+        # we always cast to float32 as this does not cause significant overhead and is compatible with bfloat16
+        image = image.cpu().permute(0, 2, 3, 1).float().numpy()
+        return image
+
+    def prepare_extra_step_kwargs(self, generator, eta):
+        # prepare extra kwargs for the scheduler step, since not all schedulers have the same signature
+        # eta (η) is only used with the DDIMScheduler, it will be ignored for other schedulers.
+        # eta corresponds to η in DDIM paper: https://arxiv.org/abs/2010.02502
+        # and should be between [0, 1]
+
+        accepts_eta = "eta" in set(inspect.signature(self.scheduler.step).parameters.keys())
+        extra_step_kwargs = {}
+        if accepts_eta:
+            extra_step_kwargs["eta"] = eta
+
+        # check if the scheduler accepts generator
+        accepts_generator = "generator" in set(inspect.signature(self.scheduler.step).parameters.keys())
+        if accepts_generator:
+            extra_step_kwargs["generator"] = generator
+        return extra_step_kwargs
+
+    def prepare_latents(self, image, timestep, batch_size, height, width, dtype, device, generator, latents=None):
+        if image is None:
+            shape = (
+                batch_size,
+                self.unet.in_channels,
+                height // self.vae_scale_factor,
+                width // self.vae_scale_factor,
+            )
+
+            if latents is None:
+                if device.type == "mps":
+                    # randn does not work reproducibly on mps
+                    latents = torch.randn(shape, generator=generator, device="cpu", dtype=dtype).to(device)
+                else:
+                    latents = torch.randn(shape, generator=generator, device=device, dtype=dtype)
+            else:
+                if latents.shape != shape:
+                    raise ValueError(f"Unexpected latents shape, got {latents.shape}, expected {shape}")
+                latents = latents.to(device)
+
+            # scale the initial noise by the standard deviation required by the scheduler
+            latents = latents * self.scheduler.init_noise_sigma
+            return latents, None, None
+        else:
+            init_latent_dist = self.vae.encode(image).latent_dist
+            init_latents = init_latent_dist.sample(generator=generator)
+            init_latents = 0.18215 * init_latents
+            init_latents = torch.cat([init_latents] * batch_size, dim=0)
+            init_latents_orig = init_latents
+            shape = init_latents.shape
+
+            # add noise to latents using the timesteps
+            if device.type == "mps":
+                noise = torch.randn(shape, generator=generator, device="cpu", dtype=dtype).to(device)
+            else:
+                noise = torch.randn(shape, generator=generator, device=device, dtype=dtype)
+            latents = self.scheduler.add_noise(init_latents, noise, timestep)
+            return latents, init_latents_orig, noise
+
+    @torch.no_grad()
+    def __call__(
+        self,
+        prompt: Union[str, List[str]],
+        negative_prompt: Optional[Union[str, List[str]]] = None,
+        image: Union[torch.FloatTensor, PIL.Image.Image] = None,
+        mask_image: Union[torch.FloatTensor, PIL.Image.Image] = None,
+        height: int = 512,
+        width: int = 512,
+        num_inference_steps: int = 50,
+        guidance_scale: float = 7.5,
+        strength: float = 0.8,
+        num_images_per_prompt: Optional[int] = 1,
+        eta: float = 0.0,
+        generator: Optional[torch.Generator] = None,
+        latents: Optional[torch.FloatTensor] = None,
+        max_embeddings_multiples: Optional[int] = 3,
+        output_type: Optional[str] = "pil",
+        return_dict: bool = True,
+        controlnet=None,
+        controlnet_image=None,
+        callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
+        is_cancelled_callback: Optional[Callable[[], bool]] = None,
+        callback_steps: int = 1,
+    ):
+        r"""
+        Function invoked when calling the pipeline for generation.
+
+        Args:
+            prompt (`str` or `List[str]`):
+                The prompt or prompts to guide the image generation.
+            negative_prompt (`str` or `List[str]`, *optional*):
+                The prompt or prompts not to guide the image generation. Ignored when not using guidance (i.e., ignored
+                if `guidance_scale` is less than `1`).
+            image (`torch.FloatTensor` or `PIL.Image.Image`):
+                `Image`, or tensor representing an image batch, that will be used as the starting point for the
+                process.
+            mask_image (`torch.FloatTensor` or `PIL.Image.Image`):
+                `Image`, or tensor representing an image batch, to mask `image`. White pixels in the mask will be
+                replaced by noise and therefore repainted, while black pixels will be preserved. If `mask_image` is a
+                PIL image, it will be converted to a single channel (luminance) before use. If it's a tensor, it should
+                contain one color channel (L) instead of 3, so the expected shape would be `(B, H, W, 1)`.
+            height (`int`, *optional*, defaults to 512):
+                The height in pixels of the generated image.
+            width (`int`, *optional*, defaults to 512):
+                The width in pixels of the generated image.
+            num_inference_steps (`int`, *optional*, defaults to 50):
+                The number of denoising steps. More denoising steps usually lead to a higher quality image at the
+                expense of slower inference.
+            guidance_scale (`float`, *optional*, defaults to 7.5):
+                Guidance scale as defined in [Classifier-Free Diffusion Guidance](https://arxiv.org/abs/2207.12598).
+                `guidance_scale` is defined as `w` of equation 2. of [Imagen
+                Paper](https://arxiv.org/pdf/2205.11487.pdf). Guidance scale is enabled by setting `guidance_scale >
+                1`. Higher guidance scale encourages to generate images that are closely linked to the text `prompt`,
+                usually at the expense of lower image quality.
+            strength (`float`, *optional*, defaults to 0.8):
+                Conceptually, indicates how much to transform the reference `image`. Must be between 0 and 1.
+                `image` will be used as a starting point, adding more noise to it the larger the `strength`. The
+                number of denoising steps depends on the amount of noise initially added. When `strength` is 1, added
+                noise will be maximum and the denoising process will run for the full number of iterations specified in
+                `num_inference_steps`. A value of 1, therefore, essentially ignores `image`.
+            num_images_per_prompt (`int`, *optional*, defaults to 1):
+                The number of images to generate per prompt.
+            eta (`float`, *optional*, defaults to 0.0):
+                Corresponds to parameter eta (η) in the DDIM paper: https://arxiv.org/abs/2010.02502. Only applies to
+                [`schedulers.DDIMScheduler`], will be ignored for others.
+            generator (`torch.Generator`, *optional*):
+                A [torch generator](https://pytorch.org/docs/stable/generated/torch.Generator.html) to make generation
+                deterministic.
+            latents (`torch.FloatTensor`, *optional*):
+                Pre-generated noisy latents, sampled from a Gaussian distribution, to be used as inputs for image
+                generation. Can be used to tweak the same generation with different prompts. If not provided, a latents
+                tensor will ge generated by sampling using the supplied random `generator`.
+            max_embeddings_multiples (`int`, *optional*, defaults to `3`):
+                The max multiple length of prompt embeddings compared to the max output length of text encoder.
+            output_type (`str`, *optional*, defaults to `"pil"`):
+                The output format of the generate image. Choose between
+                [PIL](https://pillow.readthedocs.io/en/stable/): `PIL.Image.Image` or `np.array`.
+            return_dict (`bool`, *optional*, defaults to `True`):
+                Whether or not to return a [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] instead of a
+                plain tuple.
+            controlnet (`diffusers.ControlNetModel`, *optional*):
+                A controlnet model to be used for the inference. If not provided, controlnet will be disabled.
+            controlnet_image (`torch.FloatTensor` or `PIL.Image.Image`, *optional*):
+                `Image`, or tensor representing an image batch, to be used as the starting point for the controlnet
+                inference.
+            callback (`Callable`, *optional*):
+                A function that will be called every `callback_steps` steps during inference. The function will be
+                called with the following arguments: `callback(step: int, timestep: int, latents: torch.FloatTensor)`.
+            is_cancelled_callback (`Callable`, *optional*):
+                A function that will be called every `callback_steps` steps during inference. If the function returns
+                `True`, the inference will be cancelled.
+            callback_steps (`int`, *optional*, defaults to 1):
+                The frequency at which the `callback` function will be called. If not specified, the callback will be
+                called at every step.
+
+        Returns:
+            `None` if cancelled by `is_cancelled_callback`,
+            [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] or `tuple`:
+            [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] if `return_dict` is True, otherwise a `tuple.
+            When returning a tuple, the first element is a list with the generated images, and the second element is a
+            list of `bool`s denoting whether the corresponding generated image likely represents "not-safe-for-work"
+            (nsfw) content, according to the `safety_checker`.
+        """
+        if controlnet is not None and controlnet_image is None:
+            raise ValueError("controlnet_image must be provided if controlnet is not None.")
+
+        # 0. Default height and width to unet
+        height = height or self.unet.config.sample_size * self.vae_scale_factor
+        width = width or self.unet.config.sample_size * self.vae_scale_factor
+
+        # 1. Check inputs. Raise error if not correct
+        self.check_inputs(prompt, height, width, strength, callback_steps)
+
+        # 2. Define call parameters
+        batch_size = 1 if isinstance(prompt, str) else len(prompt)
+        device = self._execution_device
+        # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
+        # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
+        # corresponds to doing no classifier free guidance.
+        do_classifier_free_guidance = guidance_scale > 1.0
+
+        # 3. Encode input prompt
+        text_embeddings = self._encode_prompt(
+            prompt,
+            device,
+            num_images_per_prompt,
+            do_classifier_free_guidance,
+            negative_prompt,
+            max_embeddings_multiples,
+        )
+        dtype = text_embeddings.dtype
+
+        # 4. Preprocess image and mask
+        if isinstance(image, PIL.Image.Image):
+            image = preprocess_image(image)
+        if image is not None:
+            image = image.to(device=self.device, dtype=dtype)
+        if isinstance(mask_image, PIL.Image.Image):
+            mask_image = preprocess_mask(mask_image, self.vae_scale_factor)
+        if mask_image is not None:
+            mask = mask_image.to(device=self.device, dtype=dtype)
+            mask = torch.cat([mask] * batch_size * num_images_per_prompt)
+        else:
+            mask = None
+
+        if controlnet_image is not None:
+            controlnet_image = prepare_controlnet_image(
+                controlnet_image, width, height, batch_size, 1, self.device, controlnet.dtype, do_classifier_free_guidance, False
+            )
+
+        # 5. set timesteps
+        self.scheduler.set_timesteps(num_inference_steps, device=device)
+        timesteps, num_inference_steps = self.get_timesteps(num_inference_steps, strength, device, image is None)
+        latent_timestep = timesteps[:1].repeat(batch_size * num_images_per_prompt)
+
+        # 6. Prepare latent variables
+        latents, init_latents_orig, noise = self.prepare_latents(
+            image,
+            latent_timestep,
+            batch_size * num_images_per_prompt,
+            height,
+            width,
+            dtype,
+            device,
+            generator,
+            latents,
+        )
+
+        # 7. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
+        extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
+
+        # 8. Denoising loop
+        for i, t in enumerate(self.progress_bar(timesteps)):
+            # expand the latents if we are doing classifier free guidance
+            latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+            latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+
+            unet_additional_args = {}
+            if controlnet is not None:
+                down_block_res_samples, mid_block_res_sample = controlnet(
+                    latent_model_input,
+                    t,
+                    encoder_hidden_states=text_embeddings,
+                    controlnet_cond=controlnet_image,
+                    conditioning_scale=1.0,
+                    guess_mode=False,
+                    return_dict=False,
+                )
+                unet_additional_args["down_block_additional_residuals"] = down_block_res_samples
+                unet_additional_args["mid_block_additional_residual"] = mid_block_res_sample
+
+            # predict the noise residual
+            noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings, **unet_additional_args).sample
+
+            # perform guidance
+            if do_classifier_free_guidance:
+                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+            # compute the previous noisy sample x_t -> x_t-1
+            latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
+
+            if mask is not None:
+                # masking
+                init_latents_proper = self.scheduler.add_noise(init_latents_orig, noise, torch.tensor([t]))
+                latents = (init_latents_proper * mask) + (latents * (1 - mask))
+
+            # call the callback, if provided
+            if i % callback_steps == 0:
+                if callback is not None:
+                    callback(i, t, latents)
+                if is_cancelled_callback is not None and is_cancelled_callback():
+                    return None
+
+        return latents
+
+    def latents_to_image(self, latents):
+        # 9. Post-processing
+        image = self.decode_latents(latents.to(self.vae.dtype))
+        image = self.numpy_to_pil(image)
+        return image
+
+    def text2img(
+        self,
+        prompt: Union[str, List[str]],
+        negative_prompt: Optional[Union[str, List[str]]] = None,
+        height: int = 512,
+        width: int = 512,
+        num_inference_steps: int = 50,
+        guidance_scale: float = 7.5,
+        num_images_per_prompt: Optional[int] = 1,
+        eta: float = 0.0,
+        generator: Optional[torch.Generator] = None,
+        latents: Optional[torch.FloatTensor] = None,
+        max_embeddings_multiples: Optional[int] = 3,
+        output_type: Optional[str] = "pil",
+        return_dict: bool = True,
+        callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
+        is_cancelled_callback: Optional[Callable[[], bool]] = None,
+        callback_steps: int = 1,
+    ):
+        r"""
+        Function for text-to-image generation.
+        Args:
+            prompt (`str` or `List[str]`):
+                The prompt or prompts to guide the image generation.
+            negative_prompt (`str` or `List[str]`, *optional*):
+                The prompt or prompts not to guide the image generation. Ignored when not using guidance (i.e., ignored
+                if `guidance_scale` is less than `1`).
+            height (`int`, *optional*, defaults to 512):
+                The height in pixels of the generated image.
+            width (`int`, *optional*, defaults to 512):
+                The width in pixels of the generated image.
+            num_inference_steps (`int`, *optional*, defaults to 50):
+                The number of denoising steps. More denoising steps usually lead to a higher quality image at the
+                expense of slower inference.
+            guidance_scale (`float`, *optional*, defaults to 7.5):
+                Guidance scale as defined in [Classifier-Free Diffusion Guidance](https://arxiv.org/abs/2207.12598).
+                `guidance_scale` is defined as `w` of equation 2. of [Imagen
+                Paper](https://arxiv.org/pdf/2205.11487.pdf). Guidance scale is enabled by setting `guidance_scale >
+                1`. Higher guidance scale encourages to generate images that are closely linked to the text `prompt`,
+                usually at the expense of lower image quality.
+            num_images_per_prompt (`int`, *optional*, defaults to 1):
+                The number of images to generate per prompt.
+            eta (`float`, *optional*, defaults to 0.0):
+                Corresponds to parameter eta (η) in the DDIM paper: https://arxiv.org/abs/2010.02502. Only applies to
+                [`schedulers.DDIMScheduler`], will be ignored for others.
+            generator (`torch.Generator`, *optional*):
+                A [torch generator](https://pytorch.org/docs/stable/generated/torch.Generator.html) to make generation
+                deterministic.
+            latents (`torch.FloatTensor`, *optional*):
+                Pre-generated noisy latents, sampled from a Gaussian distribution, to be used as inputs for image
+                generation. Can be used to tweak the same generation with different prompts. If not provided, a latents
+                tensor will ge generated by sampling using the supplied random `generator`.
+            max_embeddings_multiples (`int`, *optional*, defaults to `3`):
+                The max multiple length of prompt embeddings compared to the max output length of text encoder.
+            output_type (`str`, *optional*, defaults to `"pil"`):
+                The output format of the generate image. Choose between
+                [PIL](https://pillow.readthedocs.io/en/stable/): `PIL.Image.Image` or `np.array`.
+            return_dict (`bool`, *optional*, defaults to `True`):
+                Whether or not to return a [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] instead of a
+                plain tuple.
+            callback (`Callable`, *optional*):
+                A function that will be called every `callback_steps` steps during inference. The function will be
+                called with the following arguments: `callback(step: int, timestep: int, latents: torch.FloatTensor)`.
+            is_cancelled_callback (`Callable`, *optional*):
+                A function that will be called every `callback_steps` steps during inference. If the function returns
+                `True`, the inference will be cancelled.
+            callback_steps (`int`, *optional*, defaults to 1):
+                The frequency at which the `callback` function will be called. If not specified, the callback will be
+                called at every step.
+        Returns:
+            [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] or `tuple`:
+            [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] if `return_dict` is True, otherwise a `tuple.
+            When returning a tuple, the first element is a list with the generated images, and the second element is a
+            list of `bool`s denoting whether the corresponding generated image likely represents "not-safe-for-work"
+            (nsfw) content, according to the `safety_checker`.
+        """
+        return self.__call__(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            height=height,
+            width=width,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            num_images_per_prompt=num_images_per_prompt,
+            eta=eta,
+            generator=generator,
+            latents=latents,
+            max_embeddings_multiples=max_embeddings_multiples,
+            output_type=output_type,
+            return_dict=return_dict,
+            callback=callback,
+            is_cancelled_callback=is_cancelled_callback,
+            callback_steps=callback_steps,
+        )
+
+    def img2img(
+        self,
+        image: Union[torch.FloatTensor, PIL.Image.Image],
+        prompt: Union[str, List[str]],
+        negative_prompt: Optional[Union[str, List[str]]] = None,
+        strength: float = 0.8,
+        num_inference_steps: Optional[int] = 50,
+        guidance_scale: Optional[float] = 7.5,
+        num_images_per_prompt: Optional[int] = 1,
+        eta: Optional[float] = 0.0,
+        generator: Optional[torch.Generator] = None,
+        max_embeddings_multiples: Optional[int] = 3,
+        output_type: Optional[str] = "pil",
+        return_dict: bool = True,
+        callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
+        is_cancelled_callback: Optional[Callable[[], bool]] = None,
+        callback_steps: int = 1,
+    ):
+        r"""
+        Function for image-to-image generation.
+        Args:
+            image (`torch.FloatTensor` or `PIL.Image.Image`):
+                `Image`, or tensor representing an image batch, that will be used as the starting point for the
+                process.
+            prompt (`str` or `List[str]`):
+                The prompt or prompts to guide the image generation.
+            negative_prompt (`str` or `List[str]`, *optional*):
+                The prompt or prompts not to guide the image generation. Ignored when not using guidance (i.e., ignored
+                if `guidance_scale` is less than `1`).
+            strength (`float`, *optional*, defaults to 0.8):
+                Conceptually, indicates how much to transform the reference `image`. Must be between 0 and 1.
+                `image` will be used as a starting point, adding more noise to it the larger the `strength`. The
+                number of denoising steps depends on the amount of noise initially added. When `strength` is 1, added
+                noise will be maximum and the denoising process will run for the full number of iterations specified in
+                `num_inference_steps`. A value of 1, therefore, essentially ignores `image`.
+            num_inference_steps (`int`, *optional*, defaults to 50):
+                The number of denoising steps. More denoising steps usually lead to a higher quality image at the
+                expense of slower inference. This parameter will be modulated by `strength`.
+            guidance_scale (`float`, *optional*, defaults to 7.5):
+                Guidance scale as defined in [Classifier-Free Diffusion Guidance](https://arxiv.org/abs/2207.12598).
+                `guidance_scale` is defined as `w` of equation 2. of [Imagen
+                Paper](https://arxiv.org/pdf/2205.11487.pdf). Guidance scale is enabled by setting `guidance_scale >
+                1`. Higher guidance scale encourages to generate images that are closely linked to the text `prompt`,
+                usually at the expense of lower image quality.
+            num_images_per_prompt (`int`, *optional*, defaults to 1):
+                The number of images to generate per prompt.
+            eta (`float`, *optional*, defaults to 0.0):
+                Corresponds to parameter eta (η) in the DDIM paper: https://arxiv.org/abs/2010.02502. Only applies to
+                [`schedulers.DDIMScheduler`], will be ignored for others.
+            generator (`torch.Generator`, *optional*):
+                A [torch generator](https://pytorch.org/docs/stable/generated/torch.Generator.html) to make generation
+                deterministic.
+            max_embeddings_multiples (`int`, *optional*, defaults to `3`):
+                The max multiple length of prompt embeddings compared to the max output length of text encoder.
+            output_type (`str`, *optional*, defaults to `"pil"`):
+                The output format of the generate image. Choose between
+                [PIL](https://pillow.readthedocs.io/en/stable/): `PIL.Image.Image` or `np.array`.
+            return_dict (`bool`, *optional*, defaults to `True`):
+                Whether or not to return a [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] instead of a
+                plain tuple.
+            callback (`Callable`, *optional*):
+                A function that will be called every `callback_steps` steps during inference. The function will be
+                called with the following arguments: `callback(step: int, timestep: int, latents: torch.FloatTensor)`.
+            is_cancelled_callback (`Callable`, *optional*):
+                A function that will be called every `callback_steps` steps during inference. If the function returns
+                `True`, the inference will be cancelled.
+            callback_steps (`int`, *optional*, defaults to 1):
+                The frequency at which the `callback` function will be called. If not specified, the callback will be
+                called at every step.
+        Returns:
+            [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] or `tuple`:
+            [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] if `return_dict` is True, otherwise a `tuple.
+            When returning a tuple, the first element is a list with the generated images, and the second element is a
+            list of `bool`s denoting whether the corresponding generated image likely represents "not-safe-for-work"
+            (nsfw) content, according to the `safety_checker`.
+        """
+        return self.__call__(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            image=image,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            strength=strength,
+            num_images_per_prompt=num_images_per_prompt,
+            eta=eta,
+            generator=generator,
+            max_embeddings_multiples=max_embeddings_multiples,
+            output_type=output_type,
+            return_dict=return_dict,
+            callback=callback,
+            is_cancelled_callback=is_cancelled_callback,
+            callback_steps=callback_steps,
+        )
+
+    def inpaint(
+        self,
+        image: Union[torch.FloatTensor, PIL.Image.Image],
+        mask_image: Union[torch.FloatTensor, PIL.Image.Image],
+        prompt: Union[str, List[str]],
+        negative_prompt: Optional[Union[str, List[str]]] = None,
+        strength: float = 0.8,
+        num_inference_steps: Optional[int] = 50,
+        guidance_scale: Optional[float] = 7.5,
+        num_images_per_prompt: Optional[int] = 1,
+        eta: Optional[float] = 0.0,
+        generator: Optional[torch.Generator] = None,
+        max_embeddings_multiples: Optional[int] = 3,
+        output_type: Optional[str] = "pil",
+        return_dict: bool = True,
+        callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
+        is_cancelled_callback: Optional[Callable[[], bool]] = None,
+        callback_steps: int = 1,
+    ):
+        r"""
+        Function for inpaint.
+        Args:
+            image (`torch.FloatTensor` or `PIL.Image.Image`):
+                `Image`, or tensor representing an image batch, that will be used as the starting point for the
+                process. This is the image whose masked region will be inpainted.
+            mask_image (`torch.FloatTensor` or `PIL.Image.Image`):
+                `Image`, or tensor representing an image batch, to mask `image`. White pixels in the mask will be
+                replaced by noise and therefore repainted, while black pixels will be preserved. If `mask_image` is a
+                PIL image, it will be converted to a single channel (luminance) before use. If it's a tensor, it should
+                contain one color channel (L) instead of 3, so the expected shape would be `(B, H, W, 1)`.
+            prompt (`str` or `List[str]`):
+                The prompt or prompts to guide the image generation.
+            negative_prompt (`str` or `List[str]`, *optional*):
+                The prompt or prompts not to guide the image generation. Ignored when not using guidance (i.e., ignored
+                if `guidance_scale` is less than `1`).
+            strength (`float`, *optional*, defaults to 0.8):
+                Conceptually, indicates how much to inpaint the masked area. Must be between 0 and 1. When `strength`
+                is 1, the denoising process will be run on the masked area for the full number of iterations specified
+                in `num_inference_steps`. `image` will be used as a reference for the masked area, adding more
+                noise to that region the larger the `strength`. If `strength` is 0, no inpainting will occur.
+            num_inference_steps (`int`, *optional*, defaults to 50):
+                The reference number of denoising steps. More denoising steps usually lead to a higher quality image at
+                the expense of slower inference. This parameter will be modulated by `strength`, as explained above.
+            guidance_scale (`float`, *optional*, defaults to 7.5):
+                Guidance scale as defined in [Classifier-Free Diffusion Guidance](https://arxiv.org/abs/2207.12598).
+                `guidance_scale` is defined as `w` of equation 2. of [Imagen
+                Paper](https://arxiv.org/pdf/2205.11487.pdf). Guidance scale is enabled by setting `guidance_scale >
+                1`. Higher guidance scale encourages to generate images that are closely linked to the text `prompt`,
+                usually at the expense of lower image quality.
+            num_images_per_prompt (`int`, *optional*, defaults to 1):
+                The number of images to generate per prompt.
+            eta (`float`, *optional*, defaults to 0.0):
+                Corresponds to parameter eta (η) in the DDIM paper: https://arxiv.org/abs/2010.02502. Only applies to
+                [`schedulers.DDIMScheduler`], will be ignored for others.
+            generator (`torch.Generator`, *optional*):
+                A [torch generator](https://pytorch.org/docs/stable/generated/torch.Generator.html) to make generation
+                deterministic.
+            max_embeddings_multiples (`int`, *optional*, defaults to `3`):
+                The max multiple length of prompt embeddings compared to the max output length of text encoder.
+            output_type (`str`, *optional*, defaults to `"pil"`):
+                The output format of the generate image. Choose between
+                [PIL](https://pillow.readthedocs.io/en/stable/): `PIL.Image.Image` or `np.array`.
+            return_dict (`bool`, *optional*, defaults to `True`):
+                Whether or not to return a [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] instead of a
+                plain tuple.
+            callback (`Callable`, *optional*):
+                A function that will be called every `callback_steps` steps during inference. The function will be
+                called with the following arguments: `callback(step: int, timestep: int, latents: torch.FloatTensor)`.
+            is_cancelled_callback (`Callable`, *optional*):
+                A function that will be called every `callback_steps` steps during inference. If the function returns
+                `True`, the inference will be cancelled.
+            callback_steps (`int`, *optional*, defaults to 1):
+                The frequency at which the `callback` function will be called. If not specified, the callback will be
+                called at every step.
+        Returns:
+            [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] or `tuple`:
+            [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] if `return_dict` is True, otherwise a `tuple.
+            When returning a tuple, the first element is a list with the generated images, and the second element is a
+            list of `bool`s denoting whether the corresponding generated image likely represents "not-safe-for-work"
+            (nsfw) content, according to the `safety_checker`.
+        """
+        return self.__call__(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            image=image,
+            mask_image=mask_image,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            strength=strength,
+            num_images_per_prompt=num_images_per_prompt,
+            eta=eta,
+            generator=generator,
+            max_embeddings_multiples=max_embeddings_multiples,
+            output_type=output_type,
+            return_dict=return_dict,
+            callback=callback,
+            is_cancelled_callback=is_cancelled_callback,
+            callback_steps=callback_steps,
+        )
+
+
+library\lumina_models.py:
+# Copyright Alpha VLLM/Lumina Image 2.0 and contributors
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+# 
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+# 
+#     http://www.apache.org/licenses/LICENSE-2.0
+# 
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# References:
+# GLIDE: https://github.com/openai/glide-text2im
+# MAE: https://github.com/facebookresearch/mae/blob/main/models_mae.py
+# --------------------------------------------------------
+
+import math
+from typing import List, Optional, Tuple
+from dataclasses import dataclass
+
+import torch
+from torch import Tensor
+from torch.utils.checkpoint import checkpoint
+import torch.nn as nn
+import torch.nn.functional as F
+
+from library import custom_offloading_utils
+
+try:
+    from flash_attn import flash_attn_varlen_func
+    from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
+except:
+    # flash_attn may not be available but it is not required
+    pass
+
+try:
+    from sageattention import sageattn
+except:
+    pass
+
+try:
+    from apex.normalization import FusedRMSNorm as RMSNorm
+except:
+    import warnings
+
+    warnings.warn("Cannot import apex RMSNorm, switch to vanilla implementation")
+
+    #############################################################################
+    #                                 RMSNorm                                   #
+    #############################################################################
+
+    class RMSNorm(torch.nn.Module):
+        def __init__(self, dim: int, eps: float = 1e-6):
+            """
+            Initialize the RMSNorm normalization layer.
+
+            Args:
+                dim (int): The dimension of the input tensor.
+                eps (float, optional): A small value added to the denominator for numerical stability. Default is 1e-6.
+
+            Attributes:
+                eps (float): A small value added to the denominator for numerical stability.
+                weight (nn.Parameter): Learnable scaling parameter.
+
+            """
+            super().__init__()
+            self.eps = eps
+            self.weight = nn.Parameter(torch.ones(dim))
+
+        def _norm(self, x) -> Tensor:
+            """
+            Apply the RMSNorm normalization to the input tensor.
+
+            Args:
+                x (torch.Tensor): The input tensor.
+
+            Returns:
+                torch.Tensor: The normalized tensor.
+
+            """
+            return x * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + self.eps)
+
+        def forward(self, x: Tensor):
+            """
+            Apply RMSNorm to the input tensor.
+
+            Args:
+                x (torch.Tensor): The input tensor.
+
+            Returns:
+                torch.Tensor: The normalized tensor.
+            """
+            x_dtype = x.dtype
+            # To handle float8 we need to convert the tensor to float
+            x = x.float()
+            rrms = torch.rsqrt(torch.mean(x**2, dim=-1, keepdim=True) + 1e-6)
+            return ((x * rrms) * self.weight.float()).to(dtype=x_dtype)
+
+
+
+@dataclass
+class LuminaParams:
+    """Parameters for Lumina model configuration"""
+
+    patch_size: int = 2
+    in_channels: int = 4
+    dim: int = 4096
+    n_layers: int = 30
+    n_refiner_layers: int = 2
+    n_heads: int = 24
+    n_kv_heads: int = 8
+    multiple_of: int = 256
+    axes_dims: List[int] = None
+    axes_lens: List[int] = None
+    qk_norm: bool = False
+    ffn_dim_multiplier: Optional[float] = None
+    norm_eps: float = 1e-5
+    scaling_factor: float = 1.0
+    cap_feat_dim: int = 32
+
+    def __post_init__(self):
+        if self.axes_dims is None:
+            self.axes_dims = [36, 36, 36]
+        if self.axes_lens is None:
+            self.axes_lens = [300, 512, 512]
+
+    @classmethod
+    def get_2b_config(cls) -> "LuminaParams":
+        """Returns the configuration for the 2B parameter model"""
+        return cls(
+            patch_size=2,
+            in_channels=16,  # VAE channels
+            dim=2304,
+            n_layers=26,
+            n_heads=24,
+            n_kv_heads=8,
+            axes_dims=[32, 32, 32],
+            axes_lens=[300, 512, 512],
+            qk_norm=True,
+            cap_feat_dim=2304,  # Gemma 2 hidden_size
+        )
+
+    @classmethod
+    def get_7b_config(cls) -> "LuminaParams":
+        """Returns the configuration for the 7B parameter model"""
+        return cls(
+            patch_size=2,
+            dim=4096,
+            n_layers=32,
+            n_heads=32,
+            n_kv_heads=8,
+            axes_dims=[64, 64, 64],
+            axes_lens=[300, 512, 512],
+        )
+
+
+class GradientCheckpointMixin(nn.Module):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+
+        self.gradient_checkpointing = False
+        self.cpu_offload_checkpointing = False
+
+    def enable_gradient_checkpointing(self, cpu_offload: bool = False):
+        self.gradient_checkpointing = True
+
+    def disable_gradient_checkpointing(self, cpu_offload: bool = False):
+        self.gradient_checkpointing = False
+
+    def forward(self, *args, **kwargs):
+        if self.training and self.gradient_checkpointing:
+            return checkpoint(self._forward, *args, use_reentrant=False, **kwargs)
+        else:
+            return self._forward(*args, **kwargs)
+
+
+
+def modulate(x, scale):
+    return x * (1 + scale.unsqueeze(1))
+
+
+#############################################################################
+#             Embedding Layers for Timesteps and Class Labels               #
+#############################################################################
+
+
+class TimestepEmbedder(GradientCheckpointMixin):
+    """
+    Embeds scalar timesteps into vector representations.
+    """
+
+    def __init__(self, hidden_size, frequency_embedding_size=256):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(
+                frequency_embedding_size,
+                hidden_size,
+                bias=True,
+            ),
+            nn.SiLU(),
+            nn.Linear(
+                hidden_size,
+                hidden_size,
+                bias=True,
+            ),
+        )
+        nn.init.normal_(self.mlp[0].weight, std=0.02)
+        nn.init.zeros_(self.mlp[0].bias)
+        nn.init.normal_(self.mlp[2].weight, std=0.02)
+        nn.init.zeros_(self.mlp[2].bias)
+
+        self.frequency_embedding_size = frequency_embedding_size
+
+    @staticmethod
+    def timestep_embedding(t, dim, max_period=10000):
+        """
+        Create sinusoidal timestep embeddings.
+        :param t: a 1-D Tensor of N indices, one per batch element.
+                          These may be fractional.
+        :param dim: the dimension of the output.
+        :param max_period: controls the minimum frequency of the embeddings.
+        :return: an (N, D) Tensor of positional embeddings.
+        """
+        # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
+        half = dim // 2
+        freqs = torch.exp(-math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half).to(device=t.device)
+        args = t[:, None].float() * freqs[None]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if dim % 2:
+            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+        return embedding
+
+    def _forward(self, t):
+        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        t_emb = self.mlp(t_freq.to(self.mlp[0].weight.dtype))
+        return t_emb
+
+
+def to_cuda(x):
+    if isinstance(x, torch.Tensor):
+        return x.cuda()
+    elif isinstance(x, (list, tuple)):
+        return [to_cuda(elem) for elem in x]
+    elif isinstance(x, dict):
+        return {k: to_cuda(v) for k, v in x.items()}
+    else:
+        return x
+
+
+def to_cpu(x):
+    if isinstance(x, torch.Tensor):
+        return x.cpu()
+    elif isinstance(x, (list, tuple)):
+        return [to_cpu(elem) for elem in x]
+    elif isinstance(x, dict):
+        return {k: to_cpu(v) for k, v in x.items()}
+    else:
+        return x
+
+
+#############################################################################
+#                               Core NextDiT Model                              #
+#############################################################################
+
+
+class JointAttention(nn.Module):
+    """Multi-head attention module."""
+
+    def __init__(
+        self,
+        dim: int,
+        n_heads: int,
+        n_kv_heads: Optional[int],
+        qk_norm: bool,
+        use_flash_attn=False,
+        use_sage_attn=False,
+    ):
+        """
+        Initialize the Attention module.
+
+        Args:
+            dim (int): Number of input dimensions.
+            n_heads (int): Number of heads.
+            n_kv_heads (Optional[int]): Number of kv heads, if using GQA.
+            qk_norm (bool): Whether to use normalization for queries and keys.
+
+        """
+        super().__init__()
+        self.n_kv_heads = n_heads if n_kv_heads is None else n_kv_heads
+        self.n_local_heads = n_heads
+        self.n_local_kv_heads = self.n_kv_heads
+        self.n_rep = self.n_local_heads // self.n_local_kv_heads
+        self.head_dim = dim // n_heads
+
+        self.qkv = nn.Linear(
+            dim,
+            (n_heads + self.n_kv_heads + self.n_kv_heads) * self.head_dim,
+            bias=False,
+        )
+        nn.init.xavier_uniform_(self.qkv.weight)
+
+        self.out = nn.Linear(
+            n_heads * self.head_dim,
+            dim,
+            bias=False,
+        )
+        nn.init.xavier_uniform_(self.out.weight)
+
+        if qk_norm:
+            self.q_norm = RMSNorm(self.head_dim)
+            self.k_norm = RMSNorm(self.head_dim)
+        else:
+            self.q_norm = self.k_norm = nn.Identity()
+
+        self.use_flash_attn = use_flash_attn
+        self.use_sage_attn = use_sage_attn
+
+        if use_sage_attn :
+            self.attention_processor = self.sage_attn
+        else:
+            # self.attention_processor = xformers.ops.memory_efficient_attention
+            self.attention_processor = F.scaled_dot_product_attention
+
+    def set_attention_processor(self, attention_processor):
+        self.attention_processor = attention_processor
+
+    def get_attention_processor(self):
+        return self.attention_processor
+
+    def forward(
+        self,
+        x: Tensor,
+        x_mask: Tensor,
+        freqs_cis: Tensor,
+    ) -> Tensor:
+        """
+        Args:
+            x:
+            x_mask:
+            freqs_cis:
+        """
+        bsz, seqlen, _ = x.shape
+        dtype = x.dtype
+
+        xq, xk, xv = torch.split(
+            self.qkv(x),
+            [
+                self.n_local_heads * self.head_dim,
+                self.n_local_kv_heads * self.head_dim,
+                self.n_local_kv_heads * self.head_dim,
+            ],
+            dim=-1,
+        )
+        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+        xq = self.q_norm(xq)
+        xk = self.k_norm(xk)
+        xq = apply_rope(xq, freqs_cis=freqs_cis)
+        xk = apply_rope(xk, freqs_cis=freqs_cis)
+        xq, xk = xq.to(dtype), xk.to(dtype)
+
+        softmax_scale = math.sqrt(1 / self.head_dim)
+
+        if self.use_sage_attn:
+            # Handle GQA (Grouped Query Attention) if needed
+            n_rep = self.n_local_heads // self.n_local_kv_heads
+            if n_rep >= 1:
+                xk = xk.unsqueeze(3).repeat(1, 1, 1, n_rep, 1).flatten(2, 3)
+                xv = xv.unsqueeze(3).repeat(1, 1, 1, n_rep, 1).flatten(2, 3)
+
+            output = self.sage_attn(xq, xk, xv, x_mask, softmax_scale)
+        elif self.use_flash_attn:
+            output = self.flash_attn(xq, xk, xv, x_mask, softmax_scale)
+        else:
+            n_rep = self.n_local_heads // self.n_local_kv_heads
+            if n_rep >= 1:
+                xk = xk.unsqueeze(3).repeat(1, 1, 1, n_rep, 1).flatten(2, 3)
+                xv = xv.unsqueeze(3).repeat(1, 1, 1, n_rep, 1).flatten(2, 3)
+
+            output = (
+                self.attention_processor(
+                    xq.permute(0, 2, 1, 3),
+                    xk.permute(0, 2, 1, 3),
+                    xv.permute(0, 2, 1, 3),
+                    attn_mask=x_mask.bool().view(bsz, 1, 1, seqlen).expand(-1, self.n_local_heads, seqlen, -1),
+                    scale=softmax_scale,
+                )
+                .permute(0, 2, 1, 3)
+                .to(dtype)
+            )
+
+        output = output.flatten(-2)
+        return self.out(output)
+
+    # copied from huggingface modeling_llama.py
+    def _upad_input(self, query_layer, key_layer, value_layer, attention_mask, query_length):
+        def _get_unpad_data(attention_mask):
+            seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
+            indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
+            max_seqlen_in_batch = seqlens_in_batch.max().item()
+            cu_seqlens = F.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0))
+            return (
+                indices,
+                cu_seqlens,
+                max_seqlen_in_batch,
+            )
+
+        indices_k, cu_seqlens_k, max_seqlen_in_batch_k = _get_unpad_data(attention_mask)
+        batch_size, kv_seq_len, num_key_value_heads, head_dim = key_layer.shape
+
+        key_layer = index_first_axis(
+            key_layer.reshape(batch_size * kv_seq_len, num_key_value_heads, head_dim),
+            indices_k,
+        )
+        value_layer = index_first_axis(
+            value_layer.reshape(batch_size * kv_seq_len, num_key_value_heads, head_dim),
+            indices_k,
+        )
+        if query_length == kv_seq_len:
+            query_layer = index_first_axis(
+                query_layer.reshape(batch_size * kv_seq_len, self.n_local_heads, head_dim),
+                indices_k,
+            )
+            cu_seqlens_q = cu_seqlens_k
+            max_seqlen_in_batch_q = max_seqlen_in_batch_k
+            indices_q = indices_k
+        elif query_length == 1:
+            max_seqlen_in_batch_q = 1
+            cu_seqlens_q = torch.arange(
+                batch_size + 1, dtype=torch.int32, device=query_layer.device
+            )  # There is a memcpy here, that is very bad.
+            indices_q = cu_seqlens_q[:-1]
+            query_layer = query_layer.squeeze(1)
+        else:
+            # The -q_len: slice assumes left padding.
+            attention_mask = attention_mask[:, -query_length:]
+            query_layer, indices_q, cu_seqlens_q, max_seqlen_in_batch_q = unpad_input(query_layer, attention_mask)
+
+        return (
+            query_layer,
+            key_layer,
+            value_layer,
+            indices_q,
+            (cu_seqlens_q, cu_seqlens_k),
+            (max_seqlen_in_batch_q, max_seqlen_in_batch_k),
+        )
+
+    def sage_attn(self, q: Tensor, k: Tensor, v: Tensor, x_mask: Tensor, softmax_scale: float):
+        try:
+            bsz = q.shape[0]
+            seqlen = q.shape[1]
+
+            # Transpose tensors to match SageAttention's expected format (HND layout)
+            q_transposed = q.permute(0, 2, 1, 3)  # [batch, heads, seq_len, head_dim]
+            k_transposed = k.permute(0, 2, 1, 3)  # [batch, heads, seq_len, head_dim]
+            v_transposed = v.permute(0, 2, 1, 3)  # [batch, heads, seq_len, head_dim]
+            
+            # Handle masking for SageAttention
+            # We need to filter out masked positions - this approach handles variable sequence lengths
+            outputs = []
+            for b in range(bsz):
+                # Find valid token positions from the mask
+                valid_indices = torch.nonzero(x_mask[b], as_tuple=False).squeeze(-1)
+                if valid_indices.numel() == 0:
+                    # If all tokens are masked, create a zero output
+                    batch_output = torch.zeros(
+                        seqlen, self.n_local_heads, self.head_dim, 
+                        device=q.device, dtype=q.dtype
+                    )
+                else:
+                    # Extract only valid tokens for this batch
+                    batch_q = q_transposed[b, :, valid_indices, :]
+                    batch_k = k_transposed[b, :, valid_indices, :]
+                    batch_v = v_transposed[b, :, valid_indices, :]
+                    
+                    # Run SageAttention on valid tokens only
+                    batch_output_valid = sageattn(
+                        batch_q.unsqueeze(0),  # Add batch dimension back
+                        batch_k.unsqueeze(0), 
+                        batch_v.unsqueeze(0), 
+                        tensor_layout="HND",
+                        is_causal=False,
+                        sm_scale=softmax_scale
+                    )
+                    
+                    # Create output tensor with zeros for masked positions
+                    batch_output = torch.zeros(
+                        seqlen, self.n_local_heads, self.head_dim, 
+                        device=q.device, dtype=q.dtype
+                    )
+                    # Place valid outputs back in the right positions
+                    batch_output[valid_indices] = batch_output_valid.squeeze(0).permute(1, 0, 2)
+                    
+                outputs.append(batch_output)
+            
+            # Stack batch outputs and reshape to expected format
+            output = torch.stack(outputs, dim=0)  # [batch, seq_len, heads, head_dim]
+        except NameError as e:
+            raise RuntimeError(
+                f"Could not load Sage Attention. Please install https://github.com/thu-ml/SageAttention. / Sage Attention を読み込めませんでした。https://github.com/thu-ml/SageAttention をインストールしてください。 / {e}"
+            )
+
+        return output
+
+    def flash_attn(
+        self,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        x_mask: Tensor,
+        softmax_scale,
+    ) -> Tensor:
+        bsz, seqlen, _, _ = q.shape
+
+        try:
+            # begin var_len flash attn
+            (
+                query_states,
+                key_states,
+                value_states,
+                indices_q,
+                cu_seq_lens,
+                max_seq_lens,
+            ) = self._upad_input(q, k, v, x_mask, seqlen)
+
+            cu_seqlens_q, cu_seqlens_k = cu_seq_lens
+            max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
+
+            attn_output_unpad = flash_attn_varlen_func(
+                query_states,
+                key_states,
+                value_states,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_in_batch_q,
+                max_seqlen_k=max_seqlen_in_batch_k,
+                dropout_p=0.0,
+                causal=False,
+                softmax_scale=softmax_scale,
+            )
+            output = pad_input(attn_output_unpad, indices_q, bsz, seqlen)
+            # end var_len_flash_attn
+
+            return output
+        except NameError as e:
+            raise RuntimeError(
+                f"Could not load flash attention. Please install flash_attn. / フラッシュアテンションを読み込めませんでした。flash_attn をインストールしてください。 / {e}"
+            )
+
+
+def apply_rope(
+    x_in: torch.Tensor,
+    freqs_cis: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Apply rotary embeddings to input tensors using the given frequency
+    tensor.
+
+    This function applies rotary embeddings to the given query 'xq' and
+    key 'xk' tensors using the provided frequency tensor 'freqs_cis'. The
+    input tensors are reshaped as complex numbers, and the frequency tensor
+    is reshaped for broadcasting compatibility. The resulting tensors
+    contain rotary embeddings and are returned as real tensors.
+
+    Args:
+        x_in (torch.Tensor): Query or Key tensor to apply rotary embeddings.
+        freqs_cis (torch.Tensor): Precomputed frequency tensor for complex
+            exponentials.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: Tuple of modified query tensor
+            and key tensor with rotary embeddings.
+    """
+    with torch.autocast("cuda", enabled=False):
+        x = torch.view_as_complex(x_in.float().reshape(*x_in.shape[:-1], -1, 2))
+        freqs_cis = freqs_cis.unsqueeze(2)
+        x_out = torch.view_as_real(x * freqs_cis).flatten(3)
+
+    return x_out.type_as(x_in)
+
+
+class FeedForward(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        hidden_dim: int,
+        multiple_of: int,
+        ffn_dim_multiplier: Optional[float],
+    ):
+        """
+        Initialize the FeedForward module.
+
+        Args:
+            dim (int): Input dimension.
+            hidden_dim (int): Hidden dimension of the feedforward layer.
+            multiple_of (int): Value to ensure hidden dimension is a multiple
+                of this value.
+            ffn_dim_multiplier (float, optional): Custom multiplier for hidden
+                dimension. Defaults to None.
+
+        """
+        super().__init__()
+        # custom dim factor multiplier
+        if ffn_dim_multiplier is not None:
+            hidden_dim = int(ffn_dim_multiplier * hidden_dim)
+        hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
+
+        self.w1 = nn.Linear(
+            dim,
+            hidden_dim,
+            bias=False,
+        )
+        nn.init.xavier_uniform_(self.w1.weight)
+        self.w2 = nn.Linear(
+            hidden_dim,
+            dim,
+            bias=False,
+        )
+        nn.init.xavier_uniform_(self.w2.weight)
+        self.w3 = nn.Linear(
+            dim,
+            hidden_dim,
+            bias=False,
+        )
+        nn.init.xavier_uniform_(self.w3.weight)
+
+    # @torch.compile
+    def _forward_silu_gating(self, x1, x3):
+        return F.silu(x1) * x3
+
+    def forward(self, x):
+        return self.w2(self._forward_silu_gating(self.w1(x), self.w3(x)))
+
+
+class JointTransformerBlock(GradientCheckpointMixin):
+    def __init__(
+        self,
+        layer_id: int,
+        dim: int,
+        n_heads: int,
+        n_kv_heads: Optional[int],
+        multiple_of: int,
+        ffn_dim_multiplier: Optional[float],
+        norm_eps: float,
+        qk_norm: bool,
+        modulation=True,
+        use_flash_attn=False,
+        use_sage_attn=False,
+    ) -> None:
+        """
+        Initialize a TransformerBlock.
+
+        Args:
+            layer_id (int): Identifier for the layer.
+            dim (int): Embedding dimension of the input features.
+            n_heads (int): Number of attention heads.
+            n_kv_heads (Optional[int]): Number of attention heads in key and
+                value features (if using GQA), or set to None for the same as
+                query.
+            multiple_of (int): Number of multiple of the hidden dimension.
+            ffn_dim_multiplier (Optional[float]): Dimension multiplier for the
+                feedforward layer.
+            norm_eps (float): Epsilon value for normalization.
+            qk_norm (bool): Whether to use normalization for queries and keys.
+            modulation (bool): Whether to use modulation for the attention
+                layer.
+        """
+        super().__init__()
+        self.dim = dim
+        self.head_dim = dim // n_heads
+        self.attention = JointAttention(dim, n_heads, n_kv_heads, qk_norm, use_flash_attn=use_flash_attn, use_sage_attn=use_sage_attn)
+        self.feed_forward = FeedForward(
+            dim=dim,
+            hidden_dim=4 * dim,
+            multiple_of=multiple_of,
+            ffn_dim_multiplier=ffn_dim_multiplier,
+        )
+        self.layer_id = layer_id
+        self.attention_norm1 = RMSNorm(dim, eps=norm_eps)
+        self.ffn_norm1 = RMSNorm(dim, eps=norm_eps)
+
+        self.attention_norm2 = RMSNorm(dim, eps=norm_eps)
+        self.ffn_norm2 = RMSNorm(dim, eps=norm_eps)
+
+        self.modulation = modulation
+        if modulation:
+            self.adaLN_modulation = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(
+                    min(dim, 1024),
+                    4 * dim,
+                    bias=True,
+                ),
+            )
+            nn.init.zeros_(self.adaLN_modulation[1].weight)
+            nn.init.zeros_(self.adaLN_modulation[1].bias)
+
+    def _forward(
+        self,
+        x: torch.Tensor,
+        x_mask: torch.Tensor,
+        pe: torch.Tensor,
+        adaln_input: Optional[torch.Tensor] = None,
+    ):
+        """
+        Perform a forward pass through the TransformerBlock.
+
+        Args:
+            x (Tensor): Input tensor.
+            pe (Tensor): Rope position embedding.
+
+        Returns:
+            Tensor: Output tensor after applying attention and
+                feedforward layers.
+
+        """
+        if self.modulation:
+            assert adaln_input is not None
+            scale_msa, gate_msa, scale_mlp, gate_mlp = self.adaLN_modulation(adaln_input).chunk(4, dim=1)
+
+            x = x + gate_msa.unsqueeze(1).tanh() * self.attention_norm2(
+                self.attention(
+                    modulate(self.attention_norm1(x), scale_msa),
+                    x_mask,
+                    pe,
+                )
+            )
+            x = x + gate_mlp.unsqueeze(1).tanh() * self.ffn_norm2(
+                self.feed_forward(
+                    modulate(self.ffn_norm1(x), scale_mlp),
+                )
+            )
+        else:
+            assert adaln_input is None
+            x = x + self.attention_norm2(
+                self.attention(
+                    self.attention_norm1(x),
+                    x_mask,
+                    pe,
+                )
+            )
+            x = x + self.ffn_norm2(
+                self.feed_forward(
+                    self.ffn_norm1(x),
+                )
+            )
+        return x
+
+
+class FinalLayer(GradientCheckpointMixin):
+    """
+    The final layer of NextDiT.
+    """
+
+    def __init__(self, hidden_size, patch_size, out_channels):
+        """
+        Initialize the FinalLayer.
+
+        Args:
+            hidden_size (int): Hidden size of the input features.
+            patch_size (int): Patch size of the input features.
+            out_channels (int): Number of output channels.
+        """
+        super().__init__()
+        self.norm_final = nn.LayerNorm(
+            hidden_size,
+            elementwise_affine=False,
+            eps=1e-6,
+        )
+        self.linear = nn.Linear(
+            hidden_size,
+            patch_size * patch_size * out_channels,
+            bias=True,
+        )
+        nn.init.zeros_(self.linear.weight)
+        nn.init.zeros_(self.linear.bias)
+
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(
+                min(hidden_size, 1024),
+                hidden_size,
+                bias=True,
+            ),
+        )
+        nn.init.zeros_(self.adaLN_modulation[1].weight)
+        nn.init.zeros_(self.adaLN_modulation[1].bias)
+
+    def forward(self, x, c):
+        scale = self.adaLN_modulation(c)
+        x = modulate(self.norm_final(x), scale)
+        x = self.linear(x)
+        return x
+
+
+class RopeEmbedder:
+    def __init__(
+        self,
+        theta: float = 10000.0,
+        axes_dims: List[int] = [16, 56, 56],
+        axes_lens: List[int] = [1, 512, 512],
+    ):
+        super().__init__()
+        self.theta = theta
+        self.axes_dims = axes_dims
+        self.axes_lens = axes_lens
+        self.freqs_cis = NextDiT.precompute_freqs_cis(self.axes_dims, self.axes_lens, theta=self.theta)
+
+    def __call__(self, ids: torch.Tensor):
+        device = ids.device
+        self.freqs_cis = [freqs_cis.to(ids.device) for freqs_cis in self.freqs_cis]
+        result = []
+        for i in range(len(self.axes_dims)):
+            freqs = self.freqs_cis[i].to(ids.device)
+            index = ids[:, :, i : i + 1].repeat(1, 1, freqs.shape[-1]).to(torch.int64)
+            result.append(torch.gather(freqs.unsqueeze(0).repeat(index.shape[0], 1, 1), dim=1, index=index))
+        return torch.cat(result, dim=-1)
+
+
+class NextDiT(nn.Module):
+    """
+    Diffusion model with a Transformer backbone.
+    """
+
+    def __init__(
+        self,
+        patch_size: int = 2,
+        in_channels: int = 4,
+        dim: int = 4096,
+        n_layers: int = 32,
+        n_refiner_layers: int = 2,
+        n_heads: int = 32,
+        n_kv_heads: Optional[int] = None,
+        multiple_of: int = 256,
+        ffn_dim_multiplier: Optional[float] = None,
+        norm_eps: float = 1e-5,
+        qk_norm: bool = False,
+        cap_feat_dim: int = 5120,
+        axes_dims: List[int] = [16, 56, 56],
+        axes_lens: List[int] = [1, 512, 512],
+        use_flash_attn=False,
+        use_sage_attn=False,
+    ) -> None:
+        """
+        Initialize the NextDiT model.
+
+        Args:
+            patch_size (int): Patch size of the input features.
+            in_channels (int): Number of input channels.
+            dim (int): Hidden size of the input features.
+            n_layers (int): Number of Transformer layers.
+            n_refiner_layers (int): Number of refiner layers.
+            n_heads (int): Number of attention heads.
+            n_kv_heads (Optional[int]): Number of attention heads in key and
+                value features (if using GQA), or set to None for the same as
+                query.
+            multiple_of (int): Multiple of the hidden size.
+            ffn_dim_multiplier (Optional[float]): Dimension multiplier for the
+                feedforward layer.
+            norm_eps (float): Epsilon value for normalization.
+            qk_norm (bool): Whether to use query key normalization.
+            cap_feat_dim (int): Dimension of the caption features.
+            axes_dims (List[int]): List of dimensions for the axes.
+            axes_lens (List[int]): List of lengths for the axes.
+            use_flash_attn (bool): Whether to use Flash Attention.
+            use_sage_attn (bool): Whether to use Sage Attention. Sage Attention only supports inference.
+
+        Returns:
+            None
+        """
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = in_channels
+        self.patch_size = patch_size
+
+        self.t_embedder = TimestepEmbedder(min(dim, 1024))
+        self.cap_embedder = nn.Sequential(
+            RMSNorm(cap_feat_dim, eps=norm_eps),
+            nn.Linear(
+                cap_feat_dim,
+                dim,
+                bias=True,
+            ),
+        )
+
+        nn.init.trunc_normal_(self.cap_embedder[1].weight, std=0.02)
+        nn.init.zeros_(self.cap_embedder[1].bias)
+
+        self.context_refiner = nn.ModuleList(
+            [
+                JointTransformerBlock(
+                    layer_id,
+                    dim,
+                    n_heads,
+                    n_kv_heads,
+                    multiple_of,
+                    ffn_dim_multiplier,
+                    norm_eps,
+                    qk_norm,
+                    modulation=False,
+                )
+                for layer_id in range(n_refiner_layers)
+            ]
+        )
+
+        self.x_embedder = nn.Linear(
+            in_features=patch_size * patch_size * in_channels,
+            out_features=dim,
+            bias=True,
+        )
+        nn.init.xavier_uniform_(self.x_embedder.weight)
+        nn.init.constant_(self.x_embedder.bias, 0.0)
+
+        self.noise_refiner = nn.ModuleList(
+            [
+                JointTransformerBlock(
+                    layer_id,
+                    dim,
+                    n_heads,
+                    n_kv_heads,
+                    multiple_of,
+                    ffn_dim_multiplier,
+                    norm_eps,
+                    qk_norm,
+                    modulation=True,
+                )
+                for layer_id in range(n_refiner_layers)
+            ]
+        )
+
+
+        self.layers = nn.ModuleList(
+            [
+                JointTransformerBlock(
+                    layer_id,
+                    dim,
+                    n_heads,
+                    n_kv_heads,
+                    multiple_of,
+                    ffn_dim_multiplier,
+                    norm_eps,
+                    qk_norm,
+                    use_flash_attn=use_flash_attn,
+                    use_sage_attn=use_sage_attn,
+                )
+                for layer_id in range(n_layers)
+            ]
+        )
+        self.norm_final = RMSNorm(dim, eps=norm_eps)
+        self.final_layer = FinalLayer(dim, patch_size, self.out_channels)
+
+        assert (dim // n_heads) == sum(axes_dims)
+        self.axes_dims = axes_dims
+        self.axes_lens = axes_lens
+        self.rope_embedder = RopeEmbedder(axes_dims=axes_dims, axes_lens=axes_lens)
+        self.dim = dim
+        self.n_heads = n_heads
+
+        self.gradient_checkpointing = False
+        self.cpu_offload_checkpointing = False # TODO: not yet supported
+        self.blocks_to_swap = None # TODO: not yet supported
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
+    @property
+    def dtype(self):
+        return next(self.parameters()).dtype
+
+    def enable_gradient_checkpointing(self, cpu_offload: bool = False):
+        self.gradient_checkpointing = True
+        self.cpu_offload_checkpointing = cpu_offload
+
+        self.t_embedder.enable_gradient_checkpointing()
+
+        for block in self.layers + self.context_refiner + self.noise_refiner:
+            block.enable_gradient_checkpointing(cpu_offload=cpu_offload)
+
+        self.final_layer.enable_gradient_checkpointing()
+
+        print(f"Lumina: Gradient checkpointing enabled. CPU offload: {cpu_offload}")
+
+    def disable_gradient_checkpointing(self):
+        self.gradient_checkpointing = False
+        self.cpu_offload_checkpointing = False
+
+        self.t_embedder.disable_gradient_checkpointing()
+
+        for block in self.layers + self.context_refiner + self.noise_refiner:
+            block.disable_gradient_checkpointing()
+
+        self.final_layer.disable_gradient_checkpointing()
+
+        print("Lumina: Gradient checkpointing disabled.")
+
+    def unpatchify(
+        self,
+        x: Tensor,
+        width: int,
+        height: int,
+        encoder_seq_lengths: List[int],
+        seq_lengths: List[int],
+    ) -> Tensor:
+        """
+        Unpatchify the input tensor and embed the caption features.
+        x: (N, T, patch_size**2 * C)
+        imgs: (N, H, W, C)
+
+        Args:
+            x (Tensor): Input tensor.
+            width (int): Width of the input tensor.
+            height (int): Height of the input tensor.
+            encoder_seq_lengths (List[int]): List of encoder sequence lengths.
+            seq_lengths (List[int]): List of sequence lengths
+
+        Returns:
+            output: (N, C, H, W)
+        """
+        pH = pW = self.patch_size
+
+        output = []
+        for i, (encoder_seq_len, seq_len) in enumerate(zip(encoder_seq_lengths, seq_lengths)):
+            output.append(
+                x[i][encoder_seq_len:seq_len]
+                .view(height // pH, width // pW, pH, pW, self.out_channels)
+                .permute(4, 0, 2, 1, 3)
+                .flatten(3, 4)
+                .flatten(1, 2)
+            )
+        output = torch.stack(output, dim=0)
+
+        return output
+
+    def patchify_and_embed(
+        self,
+        x: Tensor,
+        cap_feats: Tensor,
+        cap_mask: Tensor,
+        t: Tensor,
+    ) -> Tuple[Tensor, Tensor, Tensor, List[int], List[int]]:
+        """
+        Patchify and embed the input image and caption features.
+
+        Args:
+            x: (N, C, H, W) image latents
+            cap_feats: (N, C, D) caption features
+            cap_mask: (N, C, D) caption attention mask
+            t: (N), T timesteps
+
+        Returns:
+            Tuple[Tensor, Tensor, Tensor, List[int], List[int]]:
+
+            return x, attention_mask, freqs_cis, l_effective_cap_len, seq_lengths
+        """
+        bsz, channels, height, width = x.shape
+        pH = pW = self.patch_size
+        device = x.device
+
+        l_effective_cap_len = cap_mask.sum(dim=1).tolist()
+        encoder_seq_len = cap_mask.shape[1]
+        image_seq_len = (height // self.patch_size) * (width // self.patch_size)
+
+        seq_lengths = [cap_seq_len + image_seq_len for cap_seq_len in l_effective_cap_len]
+        max_seq_len = max(seq_lengths)
+
+        position_ids = torch.zeros(bsz, max_seq_len, 3, dtype=torch.int32, device=device)
+
+        for i, (cap_len, seq_len) in enumerate(zip(l_effective_cap_len, seq_lengths)):
+            H_tokens, W_tokens = height // pH, width // pW
+
+            position_ids[i, :cap_len, 0] = torch.arange(cap_len, dtype=torch.int32, device=device)
+            position_ids[i, cap_len:seq_len, 0] = cap_len
+
+            row_ids = torch.arange(H_tokens, dtype=torch.int32, device=device).view(-1, 1).repeat(1, W_tokens).flatten()
+            col_ids = torch.arange(W_tokens, dtype=torch.int32, device=device).view(1, -1).repeat(H_tokens, 1).flatten()
+
+            position_ids[i, cap_len:seq_len, 1] = row_ids
+            position_ids[i, cap_len:seq_len, 2] = col_ids
+
+        # Get combined rotary embeddings
+        freqs_cis = self.rope_embedder(position_ids)
+
+        # Create separate rotary embeddings for captions and images
+        cap_freqs_cis = torch.zeros(
+            bsz,
+            encoder_seq_len,
+            freqs_cis.shape[-1],
+            device=device,
+            dtype=freqs_cis.dtype,
+        )
+        img_freqs_cis = torch.zeros(
+            bsz,
+            image_seq_len,
+            freqs_cis.shape[-1],
+            device=device,
+            dtype=freqs_cis.dtype,
+        )
+
+        for i, (cap_len, seq_len) in enumerate(zip(l_effective_cap_len, seq_lengths)):
+            cap_freqs_cis[i, :cap_len] = freqs_cis[i, :cap_len]
+            img_freqs_cis[i, :image_seq_len] = freqs_cis[i, cap_len:seq_len]
+
+        # Refine caption context
+        for layer in self.context_refiner:
+            cap_feats = layer(cap_feats, cap_mask, cap_freqs_cis)
+
+        x = x.view(bsz, channels, height // pH, pH, width // pW, pW).permute(0, 2, 4, 3, 5, 1).flatten(3).flatten(1, 2)
+
+        x_mask = torch.zeros(bsz, image_seq_len, dtype=torch.bool, device=device)
+        for i in range(bsz):
+            x[i, :image_seq_len] = x[i]
+            x_mask[i, :image_seq_len] = True
+
+        x = self.x_embedder(x)
+
+        # Refine image context
+        for layer in self.noise_refiner:
+            x = layer(x, x_mask, img_freqs_cis, t)
+
+        joint_hidden_states = torch.zeros(bsz, max_seq_len, self.dim, device=device, dtype=x.dtype)
+        attention_mask = torch.zeros(bsz, max_seq_len, dtype=torch.bool, device=device)
+        for i, (cap_len, seq_len) in enumerate(zip(l_effective_cap_len, seq_lengths)):
+            attention_mask[i, :seq_len] = True
+            joint_hidden_states[i, :cap_len] = cap_feats[i, :cap_len]
+            joint_hidden_states[i, cap_len:seq_len] = x[i]
+
+        x = joint_hidden_states
+
+        return x, attention_mask, freqs_cis, l_effective_cap_len, seq_lengths
+
+    def forward(self, x: Tensor, t: Tensor, cap_feats: Tensor, cap_mask: Tensor) -> Tensor:
+        """
+        Forward pass of NextDiT.
+        Args:
+            x: (N, C, H, W) image latents
+            t: (N,) tensor of diffusion timesteps
+            cap_feats: (N, L, D) caption features
+            cap_mask: (N, L) caption attention mask
+
+        Returns:
+            x: (N, C, H, W) denoised latents
+        """
+        _, _, height, width = x.shape  # B, C, H, W
+        t = self.t_embedder(t)  # (N, D)
+        cap_feats = self.cap_embedder(cap_feats)  # (N, L, D)  # todo check if able to batchify w.o. redundant compute
+
+        x, mask, freqs_cis, l_effective_cap_len, seq_lengths = self.patchify_and_embed(x, cap_feats, cap_mask, t)
+
+        if not self.blocks_to_swap:
+            for layer in self.layers:
+                x = layer(x, mask, freqs_cis, t)
+        else:
+            for block_idx, layer in enumerate(self.layers):
+                self.offloader_main.wait_for_block(block_idx)
+                
+                x = layer(x, mask, freqs_cis, t)
+                
+                self.offloader_main.submit_move_blocks(self.layers, block_idx)
+
+        x = self.final_layer(x, t)
+        x = self.unpatchify(x, width, height, l_effective_cap_len, seq_lengths)
+
+        return x
+
+    def forward_with_cfg(
+        self,
+        x: Tensor,
+        t: Tensor,
+        cap_feats: Tensor,
+        cap_mask: Tensor,
+        cfg_scale: float,
+        cfg_trunc: float = 0.25,
+        renorm_cfg: float = 1.0,
+    ):
+        """
+        Forward pass of NextDiT, but also batches the unconditional forward pass
+        for classifier-free guidance.
+        """
+        # # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
+        half = x[: len(x) // 2]
+        if t[0] < cfg_trunc:
+            combined = torch.cat([half, half], dim=0)  # [2, 16, 128, 128]
+            assert (
+                cap_mask.shape[0] == combined.shape[0]
+            ), f"caption attention mask shape: {cap_mask.shape[0]} latents shape: {combined.shape[0]}"
+            model_out = self.forward(x, t, cap_feats, cap_mask)  # [2, 16, 128, 128]
+            # For exact reproducibility reasons, we apply classifier-free guidance on only
+            # three channels by default. The standard approach to cfg applies it to all channels.
+            # This can be done by uncommenting the following line and commenting-out the line following that.
+            eps, rest = (
+                model_out[:, : self.in_channels],
+                model_out[:, self.in_channels :],
+            )
+            cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
+            half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
+            if float(renorm_cfg) > 0.0:
+                ori_pos_norm = torch.linalg.vector_norm(cond_eps, dim=tuple(range(1, len(cond_eps.shape))), keepdim=True)
+                max_new_norm = ori_pos_norm * float(renorm_cfg)
+                new_pos_norm = torch.linalg.vector_norm(half_eps, dim=tuple(range(1, len(half_eps.shape))), keepdim=True)
+                if new_pos_norm >= max_new_norm:
+                    half_eps = half_eps * (max_new_norm / new_pos_norm)
+        else:
+            combined = half
+            model_out = self.forward(
+                combined,
+                t[: len(x) // 2],
+                cap_feats[: len(x) // 2],
+                cap_mask[: len(x) // 2],
+            )
+            eps, rest = (
+                model_out[:, : self.in_channels],
+                model_out[:, self.in_channels :],
+            )
+            half_eps = eps
+
+        output = torch.cat([half_eps, half_eps], dim=0)
+        return output
+
+    @staticmethod
+    def precompute_freqs_cis(
+        dim: List[int],
+        end: List[int],
+        theta: float = 10000.0,
+    ) -> List[Tensor]:
+        """
+        Precompute the frequency tensor for complex exponentials (cis) with
+        given dimensions.
+
+        This function calculates a frequency tensor with complex exponentials
+        using the given dimension 'dim' and the end index 'end'. The 'theta'
+        parameter scales the frequencies. The returned tensor contains complex
+        values in complex64 data type.
+
+        Args:
+            dim (list): Dimension of the frequency tensor.
+            end (list): End index for precomputing frequencies.
+            theta (float, optional): Scaling factor for frequency computation.
+                Defaults to 10000.0.
+
+        Returns:
+            List[torch.Tensor]: Precomputed frequency tensor with complex
+                exponentials.
+        """
+        freqs_cis = []
+        freqs_dtype = torch.float32 if torch.backends.mps.is_available() else torch.float64
+
+        for i, (d, e) in enumerate(zip(dim, end)):
+            pos = torch.arange(e, dtype=freqs_dtype, device="cpu")
+            freqs = 1.0 / (theta ** (torch.arange(0, d, 2, dtype=freqs_dtype, device="cpu") / d))
+            freqs = torch.outer(pos, freqs)
+            freqs_cis_i = torch.polar(torch.ones_like(freqs), freqs)  # [S, D/2]
+            freqs_cis.append(freqs_cis_i)
+
+        return freqs_cis
+
+    def parameter_count(self) -> int:
+        total_params = 0
+
+        def _recursive_count_params(module):
+            nonlocal total_params
+            for param in module.parameters(recurse=False):
+                total_params += param.numel()
+            for submodule in module.children():
+                _recursive_count_params(submodule)
+
+        _recursive_count_params(self)
+        return total_params
+
+    def get_fsdp_wrap_module_list(self) -> List[nn.Module]:
+        return list(self.layers)
+
+    def get_checkpointing_wrap_module_list(self) -> List[nn.Module]:
+        return list(self.layers)
+
+    def enable_block_swap(self, blocks_to_swap: int, device: torch.device):
+        """
+        Enable block swapping to reduce memory usage during inference.
+        
+        Args:
+            num_blocks (int): Number of blocks to swap between CPU and device
+            device (torch.device): Device to use for computation
+        """
+        self.blocks_to_swap = blocks_to_swap
+        
+        # Calculate how many blocks to swap from main layers
+        
+        assert blocks_to_swap <= len(self.layers) - 2, (
+            f"Cannot swap more than {len(self.layers) - 2} main blocks. "
+            f"Requested {blocks_to_swap} blocks."
+        )
+        
+        self.offloader_main = custom_offloading_utils.ModelOffloader(
+            self.layers, blocks_to_swap, device, debug=False
+        )
+
+    def move_to_device_except_swap_blocks(self, device: torch.device):
+        """
+        Move the model to the device except for blocks that will be swapped.
+        This reduces temporary memory usage during model loading.
+        
+        Args:
+            device (torch.device): Device to move the model to
+        """
+        if self.blocks_to_swap:
+            save_layers = self.layers
+            self.layers = nn.ModuleList([])
+            
+        self.to(device)
+            
+        if self.blocks_to_swap:
+            self.layers = save_layers
+
+    def prepare_block_swap_before_forward(self):
+        """
+        Prepare blocks for swapping before forward pass.
+        """
+        if self.blocks_to_swap is None or self.blocks_to_swap == 0:
+            return
+        
+        self.offloader_main.prepare_block_devices_before_forward(self.layers)
+
+
+#############################################################################
+#                                 NextDiT Configs                               #
+#############################################################################
+
+
+def NextDiT_2B_GQA_patch2_Adaln_Refiner(params: Optional[LuminaParams] = None, **kwargs):
+    if params is None:
+        params = LuminaParams.get_2b_config()
+
+    return NextDiT(
+        patch_size=params.patch_size,
+        in_channels=params.in_channels,
+        dim=params.dim,
+        n_layers=params.n_layers,
+        n_heads=params.n_heads,
+        n_kv_heads=params.n_kv_heads,
+        axes_dims=params.axes_dims,
+        axes_lens=params.axes_lens,
+        qk_norm=params.qk_norm,
+        ffn_dim_multiplier=params.ffn_dim_multiplier,
+        norm_eps=params.norm_eps,
+        cap_feat_dim=params.cap_feat_dim,
+        **kwargs,
+    )
+
+
+def NextDiT_3B_GQA_patch2_Adaln_Refiner(**kwargs):
+    return NextDiT(
+        patch_size=2,
+        dim=2592,
+        n_layers=30,
+        n_heads=24,
+        n_kv_heads=8,
+        axes_dims=[36, 36, 36],
+        axes_lens=[300, 512, 512],
+        **kwargs,
+    )
+
+
+def NextDiT_4B_GQA_patch2_Adaln_Refiner(**kwargs):
+    return NextDiT(
+        patch_size=2,
+        dim=2880,
+        n_layers=32,
+        n_heads=24,
+        n_kv_heads=8,
+        axes_dims=[40, 40, 40],
+        axes_lens=[300, 512, 512],
+        **kwargs,
+    )
+
+
+def NextDiT_7B_GQA_patch2_Adaln_Refiner(**kwargs):
+    return NextDiT(
+        patch_size=2,
+        dim=3840,
+        n_layers=32,
+        n_heads=32,
+        n_kv_heads=8,
+        axes_dims=[40, 40, 40],
+        axes_lens=[300, 512, 512],
+        **kwargs,
+    )
+
+

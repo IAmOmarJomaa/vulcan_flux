@@ -1,0 +1,3745 @@
+library\sai_model_spec.py:
+# based on https://github.com/Stability-AI/ModelSpec
+import datetime
+import hashlib
+import argparse
+import base64
+import logging
+import mimetypes
+import subprocess
+from dataclasses import dataclass, field
+from io import BytesIO
+import os
+from typing import Union
+import safetensors
+from library.utils import setup_logging
+
+setup_logging()
+
+logger = logging.getLogger(__name__)
+
+r"""
+# Metadata Example
+metadata = {
+    # === Must ===
+    "modelspec.sai_model_spec": "1.0.0", # Required version ID for the spec
+    "modelspec.architecture": "stable-diffusion-xl-v1-base", # Architecture, reference the ID of the original model of the arch to match the ID
+    "modelspec.implementation": "sgm",
+    "modelspec.title": "Example Model Version 1.0", # Clean, human-readable title. May use your own phrasing/language/etc
+    # === Should ===
+    "modelspec.author": "Example Corp", # Your name or company name
+    "modelspec.description": "This is my example model to show you how to do it!", # Describe the model in your own words/language/etc. Focus on what users need to know
+    "modelspec.date": "2023-07-20", # ISO-8601 compliant date of when the model was created
+    # === Can ===
+    "modelspec.license": "ExampleLicense-1.0", # eg CreativeML Open RAIL, etc.
+    "modelspec.usage_hint": "Use keyword 'example'" # In your own language, very short hints about how the user should use the model
+}
+"""
+
+BASE_METADATA = {
+    # === MUST ===
+    "modelspec.sai_model_spec": "1.0.1",
+    "modelspec.architecture": None,
+    "modelspec.implementation": None,
+    "modelspec.title": None,
+    "modelspec.resolution": None,
+    # === SHOULD ===
+    "modelspec.description": None,
+    "modelspec.author": None,
+    "modelspec.date": None,
+    "modelspec.hash_sha256": None,
+    # === CAN===
+    "modelspec.implementation_version": None,
+    "modelspec.license": None,
+    "modelspec.usage_hint": None,
+    "modelspec.thumbnail": None,
+    "modelspec.tags": None,
+    "modelspec.merged_from": None,
+    "modelspec.trigger_phrase": None,
+    "modelspec.prediction_type": None,
+    "modelspec.timestep_range": None,
+    "modelspec.encoder_layer": None,
+    "modelspec.preprocessor": None,
+    "modelspec.is_negative_embedding": None,
+    "modelspec.unet_dtype": None,
+    "modelspec.vae_dtype": None,
+}
+
+# 別に使うやつだけ定義
+MODELSPEC_TITLE = "modelspec.title"
+
+ARCH_SD_V1 = "stable-diffusion-v1"
+ARCH_SD_V2_512 = "stable-diffusion-v2-512"
+ARCH_SD_V2_768_V = "stable-diffusion-v2-768-v"
+ARCH_SD_XL_V1_BASE = "stable-diffusion-xl-v1-base"
+ARCH_SD3_M = "stable-diffusion-3"  # may be followed by "-m" or "-5-large" etc.
+# ARCH_SD3_UNKNOWN = "stable-diffusion-3"
+ARCH_FLUX_1_DEV = "flux-1-dev"
+ARCH_FLUX_1_SCHNELL = "flux-1-schnell"
+ARCH_FLUX_1_CHROMA = "chroma"  # for Flux Chroma
+ARCH_FLUX_1_UNKNOWN = "flux-1"
+ARCH_LUMINA_2 = "lumina-2"
+ARCH_LUMINA_UNKNOWN = "lumina"
+ARCH_HUNYUAN_IMAGE_2_1 = "hunyuan-image-2.1"
+ARCH_HUNYUAN_IMAGE_UNKNOWN = "hunyuan-image"
+
+ADAPTER_LORA = "lora"
+ADAPTER_TEXTUAL_INVERSION = "textual-inversion"
+
+IMPL_STABILITY_AI = "https://github.com/Stability-AI/generative-models"
+IMPL_COMFY_UI = "https://github.com/comfyanonymous/ComfyUI"
+IMPL_DIFFUSERS = "diffusers"
+IMPL_FLUX = "https://github.com/black-forest-labs/flux"
+IMPL_CHROMA = "https://huggingface.co/lodestones/Chroma"
+IMPL_LUMINA = "https://github.com/Alpha-VLLM/Lumina-Image-2.0"
+IMPL_HUNYUAN_IMAGE = "https://github.com/Tencent-Hunyuan/HunyuanImage-2.1"
+
+PRED_TYPE_EPSILON = "epsilon"
+PRED_TYPE_V = "v"
+
+
+@dataclass
+class ModelSpecMetadata:
+    """
+    ModelSpec 1.0.1 compliant metadata for safetensors models.
+    All fields correspond to modelspec.* keys in the final metadata.
+    """
+
+    # === MUST ===
+    architecture: str
+    implementation: str
+    title: str
+    resolution: str
+    sai_model_spec: str = "1.0.1"
+
+    # === SHOULD ===
+    description: str | None = None
+    author: str | None = None
+    date: str | None = None
+    hash_sha256: str | None = None
+
+    # === CAN ===
+    implementation_version: str | None = None
+    license: str | None = None
+    usage_hint: str | None = None
+    thumbnail: str | None = None
+    tags: str | None = None
+    merged_from: str | None = None
+    trigger_phrase: str | None = None
+    prediction_type: str | None = None
+    timestep_range: str | None = None
+    encoder_layer: str | None = None
+    preprocessor: str | None = None
+    is_negative_embedding: str | None = None
+    unet_dtype: str | None = None
+    vae_dtype: str | None = None
+
+    # === Additional metadata ===
+    additional_fields: dict[str, str] = field(default_factory=dict)
+
+    def to_metadata_dict(self) -> dict[str, str]:
+        """Convert dataclass to metadata dictionary with modelspec. prefixes."""
+        metadata = {}
+
+        # Add all non-None fields with modelspec prefix
+        for field_name, value in self.__dict__.items():
+            if field_name == "additional_fields":
+                # Handle additional fields separately
+                for key, val in value.items():
+                    if key.startswith("modelspec."):
+                        metadata[key] = val
+                    else:
+                        metadata[f"modelspec.{key}"] = val
+            elif value is not None:
+                metadata[f"modelspec.{field_name}"] = value
+
+        return metadata
+
+    @classmethod
+    def from_args(cls, args, **kwargs) -> "ModelSpecMetadata":
+        """Create ModelSpecMetadata from argparse Namespace, extracting metadata_* fields."""
+        metadata_fields = {}
+
+        # Extract all metadata_* attributes from args
+        for attr_name in dir(args):
+            if attr_name.startswith("metadata_") and not attr_name.startswith("metadata___"):
+                value = getattr(args, attr_name, None)
+                if value is not None:
+                    # Remove metadata_ prefix
+                    field_name = attr_name[9:]  # len("metadata_") = 9
+                    metadata_fields[field_name] = value
+
+        # Handle known standard fields
+        standard_fields = {
+            "author": metadata_fields.pop("author", None),
+            "description": metadata_fields.pop("description", None),
+            "license": metadata_fields.pop("license", None),
+            "tags": metadata_fields.pop("tags", None),
+        }
+
+        # Remove None values
+        standard_fields = {k: v for k, v in standard_fields.items() if v is not None}
+
+        # Merge with kwargs and remaining metadata fields
+        all_fields = {**standard_fields, **kwargs}
+        if metadata_fields:
+            all_fields["additional_fields"] = metadata_fields
+
+        return cls(**all_fields)
+
+
+def determine_architecture(
+    v2: bool, v_parameterization: bool, sdxl: bool, lora: bool, textual_inversion: bool, model_config: dict[str, str] | None = None
+) -> str:
+    """Determine model architecture string from parameters."""
+
+    model_config = model_config or {}
+
+    if sdxl:
+        arch = ARCH_SD_XL_V1_BASE
+    elif "sd3" in model_config:
+        arch = ARCH_SD3_M + "-" + model_config["sd3"]
+    elif "flux" in model_config:
+        flux_type = model_config["flux"]
+        if flux_type == "dev":
+            arch = ARCH_FLUX_1_DEV
+        elif flux_type == "schnell":
+            arch = ARCH_FLUX_1_SCHNELL
+        elif flux_type == "chroma":
+            arch = ARCH_FLUX_1_CHROMA
+        else:
+            arch = ARCH_FLUX_1_UNKNOWN
+    elif "lumina" in model_config:
+        lumina_type = model_config["lumina"]
+        if lumina_type == "lumina2":
+            arch = ARCH_LUMINA_2
+        else:
+            arch = ARCH_LUMINA_UNKNOWN
+    elif "hunyuan_image" in model_config:
+        hunyuan_image_type = model_config["hunyuan_image"]
+        if hunyuan_image_type == "2.1":
+            arch = ARCH_HUNYUAN_IMAGE_2_1
+        else:
+            arch = ARCH_HUNYUAN_IMAGE_UNKNOWN
+    elif v2:
+        arch = ARCH_SD_V2_768_V if v_parameterization else ARCH_SD_V2_512
+    else:
+        arch = ARCH_SD_V1
+
+    # Add adapter suffix
+    if lora:
+        arch += f"/{ADAPTER_LORA}"
+    elif textual_inversion:
+        arch += f"/{ADAPTER_TEXTUAL_INVERSION}"
+
+    return arch
+
+
+def determine_implementation(
+    lora: bool,
+    textual_inversion: bool,
+    sdxl: bool,
+    model_config: dict[str, str] | None = None,
+    is_stable_diffusion_ckpt: bool | None = None,
+) -> str:
+    """Determine implementation string from parameters."""
+
+    model_config = model_config or {}
+
+    if "flux" in model_config:
+        if model_config["flux"] == "chroma":
+            return IMPL_CHROMA
+        else:
+            return IMPL_FLUX
+    elif "lumina" in model_config:
+        return IMPL_LUMINA
+    elif (lora and sdxl) or textual_inversion or is_stable_diffusion_ckpt:
+        return IMPL_STABILITY_AI
+    else:
+        return IMPL_DIFFUSERS
+
+
+def get_implementation_version() -> str:
+    """Get the current implementation version as sd-scripts/{commit_hash}."""
+    try:
+        # Get the git commit hash
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            cwd=os.path.dirname(os.path.dirname(__file__)),  # Go up to sd-scripts root
+            timeout=5,
+        )
+
+        if result.returncode == 0:
+            commit_hash = result.stdout.strip()
+            return f"sd-scripts/{commit_hash}"
+        else:
+            logger.warning("Failed to get git commit hash, using fallback")
+            return "sd-scripts/unknown"
+
+    except (subprocess.TimeoutExpired, subprocess.SubprocessError, FileNotFoundError) as e:
+        logger.warning(f"Could not determine git commit: {e}")
+        return "sd-scripts/unknown"
+
+
+def file_to_data_url(file_path: str) -> str:
+    """Convert a file path to a data URL for embedding in metadata."""
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"File not found: {file_path}")
+
+    # Get MIME type
+    mime_type, _ = mimetypes.guess_type(file_path)
+    if mime_type is None:
+        # Default to binary if we can't detect
+        mime_type = "application/octet-stream"
+
+    # Read file and encode as base64
+    with open(file_path, "rb") as f:
+        file_data = f.read()
+
+    encoded_data = base64.b64encode(file_data).decode("ascii")
+
+    return f"data:{mime_type};base64,{encoded_data}"
+
+
+def determine_resolution(
+    reso: Union[int, tuple[int, int]] | None = None,
+    sdxl: bool = False,
+    model_config: dict[str, str] | None = None,
+    v2: bool = False,
+    v_parameterization: bool = False,
+) -> str:
+    """Determine resolution string from parameters."""
+
+    model_config = model_config or {}
+
+    if reso is not None:
+        # Handle comma separated string
+        if isinstance(reso, str):
+            reso = tuple(map(int, reso.split(",")))
+        # Handle single int
+        if isinstance(reso, int):
+            reso = (reso, reso)
+        # Handle single-element tuple
+        if len(reso) == 1:
+            reso = (reso[0], reso[0])
+    else:
+        # Determine default resolution based on model type
+        if sdxl or "sd3" in model_config or "flux" in model_config or "lumina" in model_config:
+            reso = (1024, 1024)
+        elif v2 and v_parameterization:
+            reso = (768, 768)
+        else:
+            reso = (512, 512)
+
+    return f"{reso[0]}x{reso[1]}"
+
+
+def load_bytes_in_safetensors(tensors):
+    bytes = safetensors.torch.save(tensors)
+    b = BytesIO(bytes)
+
+    b.seek(0)
+    header = b.read(8)
+    n = int.from_bytes(header, "little")
+
+    offset = n + 8
+    b.seek(offset)
+
+    return b.read()
+
+
+def precalculate_safetensors_hashes(state_dict):
+    # calculate each tensor one by one to reduce memory usage
+    hash_sha256 = hashlib.sha256()
+    for tensor in state_dict.values():
+        single_tensor_sd = {"tensor": tensor}
+        bytes_for_tensor = load_bytes_in_safetensors(single_tensor_sd)
+        hash_sha256.update(bytes_for_tensor)
+
+    return f"0x{hash_sha256.hexdigest()}"
+
+
+def update_hash_sha256(metadata: dict, state_dict: dict):
+    raise NotImplementedError
+
+
+def build_metadata_dataclass(
+    state_dict: dict | None,
+    v2: bool,
+    v_parameterization: bool,
+    sdxl: bool,
+    lora: bool,
+    textual_inversion: bool,
+    timestamp: float,
+    title: str | None = None,
+    reso: int | tuple[int, int] | None = None,
+    is_stable_diffusion_ckpt: bool | None = None,
+    author: str | None = None,
+    description: str | None = None,
+    license: str | None = None,
+    tags: str | None = None,
+    merged_from: str | None = None,
+    timesteps: tuple[int, int] | None = None,
+    clip_skip: int | None = None,
+    model_config: dict | None = None,
+    optional_metadata: dict | None = None,
+) -> ModelSpecMetadata:
+    """
+    Build ModelSpec 1.0.1 compliant metadata dataclass.
+
+    Args:
+        model_config: Dict containing model type info, e.g. {"flux": "dev"}, {"sd3": "large"}
+        optional_metadata: Dict of additional metadata fields to include
+    """
+
+    # Use helper functions for complex logic
+    architecture = determine_architecture(v2, v_parameterization, sdxl, lora, textual_inversion, model_config)
+
+    if not lora and not textual_inversion and is_stable_diffusion_ckpt is None:
+        is_stable_diffusion_ckpt = True  # default is stable diffusion ckpt if not lora and not textual_inversion
+
+    implementation = determine_implementation(lora, textual_inversion, sdxl, model_config, is_stable_diffusion_ckpt)
+
+    if title is None:
+        if lora:
+            title = "LoRA"
+        elif textual_inversion:
+            title = "TextualInversion"
+        else:
+            title = "Checkpoint"
+        title += f"@{timestamp}"
+
+    # remove microsecond from time
+    int_ts = int(timestamp)
+    # time to iso-8601 compliant date
+    date = datetime.datetime.fromtimestamp(int_ts).isoformat()
+
+    # Use helper function for resolution
+    resolution = determine_resolution(reso, sdxl, model_config, v2, v_parameterization)
+
+    # Handle prediction type - Flux models don't use prediction_type
+    model_config = model_config or {}
+    prediction_type = None
+    if "flux" not in model_config:
+        if v_parameterization:
+            prediction_type = PRED_TYPE_V
+        else:
+            prediction_type = PRED_TYPE_EPSILON
+
+    # Handle timesteps
+    timestep_range = None
+    if timesteps is not None:
+        if isinstance(timesteps, str) or isinstance(timesteps, int):
+            timesteps = (timesteps, timesteps)
+        if len(timesteps) == 1:
+            timesteps = (timesteps[0], timesteps[0])
+        timestep_range = f"{timesteps[0]},{timesteps[1]}"
+
+    # Handle encoder layer (clip skip)
+    encoder_layer = None
+    if clip_skip is not None:
+        encoder_layer = f"{clip_skip}"
+
+    # TODO: Implement hash calculation when memory-efficient method is available
+    # hash_sha256 = None
+    # if state_dict is not None:
+    #     hash_sha256 = precalculate_safetensors_hashes(state_dict)
+
+    # Process thumbnail - convert file path to data URL if needed
+    processed_optional_metadata = optional_metadata.copy() if optional_metadata else {}
+    if "thumbnail" in processed_optional_metadata:
+        thumbnail_value = processed_optional_metadata["thumbnail"]
+        # Check if it's already a data URL or if it's a file path
+        if thumbnail_value and not thumbnail_value.startswith("data:"):
+            try:
+                processed_optional_metadata["thumbnail"] = file_to_data_url(thumbnail_value)
+                logger.info(f"Converted thumbnail file {thumbnail_value} to data URL")
+            except FileNotFoundError as e:
+                logger.warning(f"Thumbnail file not found, skipping: {e}")
+                del processed_optional_metadata["thumbnail"]
+            except Exception as e:
+                logger.warning(f"Failed to convert thumbnail to data URL: {e}")
+                del processed_optional_metadata["thumbnail"]
+
+    # Automatically set implementation version if not provided
+    if "implementation_version" not in processed_optional_metadata:
+        processed_optional_metadata["implementation_version"] = get_implementation_version()
+
+    # Create the dataclass
+    metadata = ModelSpecMetadata(
+        architecture=architecture,
+        implementation=implementation,
+        title=title,
+        description=description,
+        author=author,
+        date=date,
+        license=license,
+        tags=tags,
+        merged_from=merged_from,
+        resolution=resolution,
+        prediction_type=prediction_type,
+        timestep_range=timestep_range,
+        encoder_layer=encoder_layer,
+        additional_fields=processed_optional_metadata,
+    )
+
+    return metadata
+
+
+def build_metadata(
+    state_dict: dict | None,
+    v2: bool,
+    v_parameterization: bool,
+    sdxl: bool,
+    lora: bool,
+    textual_inversion: bool,
+    timestamp: float,
+    title: str | None = None,
+    reso: int | tuple[int, int] | None = None,
+    is_stable_diffusion_ckpt: bool | None = None,
+    author: str | None = None,
+    description: str | None = None,
+    license: str | None = None,
+    tags: str | None = None,
+    merged_from: str | None = None,
+    timesteps: tuple[int, int] | None = None,
+    clip_skip: int | None = None,
+    model_config: dict | None = None,
+    optional_metadata: dict | None = None,
+) -> dict[str, str]:
+    """
+    Build ModelSpec 1.0.1 compliant metadata for safetensors models.
+    Legacy function that returns dict - prefer build_metadata_dataclass for new code.
+
+    Args:
+        model_config: Dict containing model type info, e.g. {"flux": "dev"}, {"sd3": "large"}
+        optional_metadata: Dict of additional metadata fields to include
+    """
+    # Use the dataclass function and convert to dict
+    metadata_obj = build_metadata_dataclass(
+        state_dict=state_dict,
+        v2=v2,
+        v_parameterization=v_parameterization,
+        sdxl=sdxl,
+        lora=lora,
+        textual_inversion=textual_inversion,
+        timestamp=timestamp,
+        title=title,
+        reso=reso,
+        is_stable_diffusion_ckpt=is_stable_diffusion_ckpt,
+        author=author,
+        description=description,
+        license=license,
+        tags=tags,
+        merged_from=merged_from,
+        timesteps=timesteps,
+        clip_skip=clip_skip,
+        model_config=model_config,
+        optional_metadata=optional_metadata,
+    )
+
+    return metadata_obj.to_metadata_dict()
+
+
+# region utils
+
+
+def get_title(metadata: dict) -> str | None:
+    return metadata.get(MODELSPEC_TITLE, None)
+
+
+def load_metadata_from_safetensors(model: str) -> dict:
+    if not model.endswith(".safetensors"):
+        return {}
+
+    with safetensors.safe_open(model, framework="pt") as f:
+        metadata = f.metadata()
+    if metadata is None:
+        metadata = {}
+    return metadata
+
+
+def build_merged_from(models: list[str]) -> str:
+    def get_title(model: str):
+        metadata = load_metadata_from_safetensors(model)
+        title = metadata.get(MODELSPEC_TITLE, None)
+        if title is None:
+            title = os.path.splitext(os.path.basename(model))[0]  # use filename
+        return title
+
+    titles = [get_title(model) for model in models]
+    return ", ".join(titles)
+
+
+def add_model_spec_arguments(parser: argparse.ArgumentParser):
+    """Add all ModelSpec metadata arguments to the parser."""
+
+    parser.add_argument(
+        "--metadata_title",
+        type=str,
+        default=None,
+        help="title for model metadata (default is output_name) / メタデータに書き込まれるモデルタイトル、省略時はoutput_name",
+    )
+    parser.add_argument(
+        "--metadata_author",
+        type=str,
+        default=None,
+        help="author name for model metadata / メタデータに書き込まれるモデル作者名",
+    )
+    parser.add_argument(
+        "--metadata_description",
+        type=str,
+        default=None,
+        help="description for model metadata / メタデータに書き込まれるモデル説明",
+    )
+    parser.add_argument(
+        "--metadata_license",
+        type=str,
+        default=None,
+        help="license for model metadata / メタデータに書き込まれるモデルライセンス",
+    )
+    parser.add_argument(
+        "--metadata_tags",
+        type=str,
+        default=None,
+        help="tags for model metadata, separated by comma / メタデータに書き込まれるモデルタグ、カンマ区切り",
+    )
+    parser.add_argument(
+        "--metadata_usage_hint",
+        type=str,
+        default=None,
+        help="usage hint for model metadata / メタデータに書き込まれる使用方法のヒント",
+    )
+    parser.add_argument(
+        "--metadata_thumbnail",
+        type=str,
+        default=None,
+        help="thumbnail image as data URL or file path (will be converted to data URL) for model metadata / メタデータに書き込まれるサムネイル画像（データURLまたはファイルパス、ファイルパスの場合はデータURLに変換されます）",
+    )
+    parser.add_argument(
+        "--metadata_merged_from",
+        type=str,
+        default=None,
+        help="source models for merged model metadata / メタデータに書き込まれるマージ元モデル名",
+    )
+    parser.add_argument(
+        "--metadata_trigger_phrase",
+        type=str,
+        default=None,
+        help="trigger phrase for model metadata / メタデータに書き込まれるトリガーフレーズ",
+    )
+    parser.add_argument(
+        "--metadata_preprocessor",
+        type=str,
+        default=None,
+        help="preprocessor used for model metadata / メタデータに書き込まれる前処理手法",
+    )
+    parser.add_argument(
+        "--metadata_is_negative_embedding",
+        type=str,
+        default=None,
+        help="whether this is a negative embedding for model metadata / メタデータに書き込まれるネガティブ埋め込みかどうか",
+    )
+
+
+# endregion
+
+
+r"""
+if __name__ == "__main__":
+    import argparse
+    import torch
+    from safetensors.torch import load_file
+    from library import train_util
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ckpt", type=str, required=True)
+    args = parser.parse_args()
+
+    print(f"Loading {args.ckpt}")
+    state_dict = load_file(args.ckpt)
+
+    print(f"Calculating metadata")
+    metadata = get(state_dict, False, False, False, False, "sgm", False, False, "title", "date", 256, 1000, 0)
+    print(metadata)
+    del state_dict
+
+    # by reference implementation
+    with open(args.ckpt, mode="rb") as file_data:
+        file_hash = hashlib.sha256()
+        head_len = struct.unpack("Q", file_data.read(8))  # int64 header length prefix
+        header = json.loads(file_data.read(head_len[0]))  # header itself, json string
+        content = (
+            file_data.read()
+        )  # All other content is tightly packed tensors. Copy to RAM for simplicity, but you can avoid this read with a more careful FS-dependent impl.
+        file_hash.update(content)
+        # ===== Update the hash for modelspec =====
+        by_ref = f"0x{file_hash.hexdigest()}"
+    print(by_ref)
+    print("is same?", by_ref == metadata["modelspec.hash_sha256"])
+
+"""
+
+
+library\sd3_models.py:
+# some modules/classes are copied and modified from https://github.com/mcmonkey4eva/sd3-ref
+# the original code is licensed under the MIT License
+
+# and some module/classes are contributed from KohakuBlueleaf. Thanks for the contribution!
+
+from ast import Tuple
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from functools import partial
+import math
+from types import SimpleNamespace
+from typing import Dict, List, Optional, Union
+import einops
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
+from transformers import CLIPTokenizer, T5TokenizerFast
+
+from library import custom_offloading_utils
+from library.device_utils import clean_memory_on_device
+
+from .utils import setup_logging
+
+setup_logging()
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+memory_efficient_attention = None
+try:
+    import xformers
+except:
+    pass
+
+try:
+    from xformers.ops import memory_efficient_attention
+except:
+    memory_efficient_attention = None
+
+
+# region mmdit
+
+
+@dataclass
+class SD3Params:
+    patch_size: int
+    depth: int
+    num_patches: int
+    pos_embed_max_size: int
+    adm_in_channels: int
+    qk_norm: Optional[str]
+    x_block_self_attn_layers: list[int]
+    context_embedder_in_features: int
+    context_embedder_out_features: int
+    model_type: str
+
+
+def get_2d_sincos_pos_embed(
+    embed_dim,
+    grid_size,
+    scaling_factor=None,
+    offset=None,
+):
+    grid_h = np.arange(grid_size, dtype=np.float32)
+    grid_w = np.arange(grid_size, dtype=np.float32)
+    grid = np.meshgrid(grid_w, grid_h)  # here w goes first
+    grid = np.stack(grid, axis=0)
+    if scaling_factor is not None:
+        grid = grid / scaling_factor
+    if offset is not None:
+        grid = grid - offset
+
+    grid = grid.reshape([2, 1, grid_size, grid_size])
+    pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
+    return pos_embed
+
+
+def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
+    assert embed_dim % 2 == 0
+
+    # use half of dimensions to encode grid_h
+    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])  # (H*W, D/2)
+    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])  # (H*W, D/2)
+
+    emb = np.concatenate([emb_h, emb_w], axis=1)  # (H*W, D)
+    return emb
+
+
+def get_scaled_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0, sample_size=64, base_size=16):
+    """
+    This function is contributed by KohakuBlueleaf. Thanks for the contribution!
+
+    Creates scaled 2D sinusoidal positional embeddings that maintain consistent relative positions
+    when the resolution differs from the training resolution.
+
+    Args:
+        embed_dim (int): Dimension of the positional embedding.
+        grid_size (int or tuple): Size of the position grid (H, W). If int, assumes square grid.
+        cls_token (bool): Whether to include class token. Defaults to False.
+        extra_tokens (int): Number of extra tokens (e.g., cls_token). Defaults to 0.
+        sample_size (int): Reference resolution (typically training resolution). Defaults to 64.
+        base_size (int): Base grid size used during training. Defaults to 16.
+
+    Returns:
+        numpy.ndarray: Positional embeddings of shape (H*W, embed_dim) or
+                      (H*W + extra_tokens, embed_dim) if cls_token is True.
+    """
+    # Convert grid_size to tuple if it's an integer
+    if isinstance(grid_size, int):
+        grid_size = (grid_size, grid_size)
+
+    # Create normalized grid coordinates (0 to 1)
+    grid_h = np.arange(grid_size[0], dtype=np.float32) / grid_size[0]
+    grid_w = np.arange(grid_size[1], dtype=np.float32) / grid_size[1]
+
+    # Calculate scaling factors for height and width
+    # This ensures that the central region matches the original resolution's embeddings
+    scale_h = base_size * grid_size[0] / (sample_size)
+    scale_w = base_size * grid_size[1] / (sample_size)
+
+    # Calculate shift values to center the original resolution's embedding region
+    # This ensures that the central sample_size x sample_size region has similar
+    # positional embeddings to the original resolution
+    shift_h = 1 * scale_h * (grid_size[0] - sample_size) / (2 * grid_size[0])
+    shift_w = 1 * scale_w * (grid_size[1] - sample_size) / (2 * grid_size[1])
+
+    # Apply scaling and shifting to create the final grid coordinates
+    grid_h = grid_h * scale_h - shift_h
+    grid_w = grid_w * scale_w - shift_w
+
+    # Create 2D grid using meshgrid (note: w goes first)
+    grid = np.meshgrid(grid_w, grid_h)
+    grid = np.stack(grid, axis=0)
+
+    # # Calculate the starting indices for the central region
+    # # This is used for debugging/visualization of the central region
+    # st_h = (grid_size[0] - sample_size) // 2
+    # st_w = (grid_size[1] - sample_size) // 2
+    # print(grid[:, st_h : st_h + sample_size, st_w : st_w + sample_size])
+
+    # Reshape grid for positional embedding calculation
+    grid = grid.reshape([2, 1, grid_size[1], grid_size[0]])
+
+    # Generate the sinusoidal positional embeddings
+    pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
+
+    # Add zeros for extra tokens (e.g., [CLS] token) if required
+    if cls_token and extra_tokens > 0:
+        pos_embed = np.concatenate([np.zeros([extra_tokens, embed_dim]), pos_embed], axis=0)
+
+    return pos_embed
+
+
+# if __name__ == "__main__":
+#     # This is what you get when you load SD3.5 state dict
+#     pos_emb = torch.from_numpy(get_scaled_2d_sincos_pos_embed(
+#         1536, [384, 384], sample_size=64, base_size=16
+#     )).float().unsqueeze(0)
+
+
+def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
+    """
+    embed_dim: output dimension for each position
+    pos: a list of positions to be encoded: size (M,)
+    out: (M, D)
+    """
+    assert embed_dim % 2 == 0
+    omega = np.arange(embed_dim // 2, dtype=np.float64)
+    omega /= embed_dim / 2.0
+    omega = 1.0 / 10000**omega  # (D/2,)
+
+    pos = pos.reshape(-1)  # (M,)
+    out = np.einsum("m,d->md", pos, omega)  # (M, D/2), outer product
+
+    emb_sin = np.sin(out)  # (M, D/2)
+    emb_cos = np.cos(out)  # (M, D/2)
+
+    emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
+    return emb
+
+
+def get_1d_sincos_pos_embed_from_grid_torch(
+    embed_dim,
+    pos,
+    device=None,
+    dtype=torch.float32,
+):
+    omega = torch.arange(embed_dim // 2, device=device, dtype=dtype)
+    omega *= 2.0 / embed_dim
+    omega = 1.0 / 10000**omega
+    out = torch.outer(pos.reshape(-1), omega)
+    emb = torch.cat([out.sin(), out.cos()], dim=1)
+    return emb
+
+
+def get_2d_sincos_pos_embed_torch(
+    embed_dim,
+    w,
+    h,
+    val_center=7.5,
+    val_magnitude=7.5,
+    device=None,
+    dtype=torch.float32,
+):
+    small = min(h, w)
+    val_h = (h / small) * val_magnitude
+    val_w = (w / small) * val_magnitude
+    grid_h, grid_w = torch.meshgrid(
+        torch.linspace(-val_h + val_center, val_h + val_center, h, device=device, dtype=dtype),
+        torch.linspace(-val_w + val_center, val_w + val_center, w, device=device, dtype=dtype),
+        indexing="ij",
+    )
+    emb_h = get_1d_sincos_pos_embed_from_grid_torch(embed_dim // 2, grid_h, device=device, dtype=dtype)
+    emb_w = get_1d_sincos_pos_embed_from_grid_torch(embed_dim // 2, grid_w, device=device, dtype=dtype)
+    emb = torch.cat([emb_w, emb_h], dim=1)  # (H*W, D)
+    return emb
+
+
+def modulate(x, shift, scale):
+    if shift is None:
+        shift = torch.zeros_like(scale)
+    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+
+def default(x, default_value):
+    if x is None:
+        return default_value
+    return x
+
+
+def timestep_embedding(t, dim, max_period=10000):
+    half = dim // 2
+    # freqs = torch.exp(-math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half).to(
+    #     device=t.device, dtype=t.dtype
+    # )
+    freqs = torch.exp(-math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half).to(device=t.device)
+    args = t[:, None].float() * freqs[None]
+    embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+    if dim % 2:
+        embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+    if torch.is_floating_point(t):
+        embedding = embedding.to(dtype=t.dtype)
+    return embedding
+
+
+class PatchEmbed(nn.Module):
+    def __init__(
+        self,
+        img_size=256,
+        patch_size=4,
+        in_channels=3,
+        embed_dim=512,
+        norm_layer=None,
+        flatten=True,
+        bias=True,
+        strict_img_size=True,
+        dynamic_img_pad=False,
+    ):
+        # dynamic_img_pad and norm is omitted in SD3.5
+        super().__init__()
+        self.patch_size = patch_size
+        self.flatten = flatten
+        self.strict_img_size = strict_img_size
+        self.dynamic_img_pad = dynamic_img_pad
+        if img_size is not None:
+            self.img_size = img_size
+            self.grid_size = img_size // patch_size
+            self.num_patches = self.grid_size**2
+        else:
+            self.img_size = None
+            self.grid_size = None
+            self.num_patches = None
+
+        self.proj = nn.Conv2d(in_channels, embed_dim, patch_size, patch_size, bias=bias)
+        self.norm = nn.Identity() if norm_layer is None else norm_layer(embed_dim)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+
+        if self.dynamic_img_pad:
+            # Pad input so we won't have partial patch
+            pad_h = (self.patch_size - H % self.patch_size) % self.patch_size
+            pad_w = (self.patch_size - W % self.patch_size) % self.patch_size
+            x = nn.functional.pad(x, (0, pad_w, 0, pad_h), mode="reflect")
+        x = self.proj(x)
+        if self.flatten:
+            x = x.flatten(2).transpose(1, 2)
+        x = self.norm(x)
+        return x
+
+
+# FinalLayer in mmdit.py
+class UnPatch(nn.Module):
+    def __init__(self, hidden_size=512, patch_size=4, out_channels=3):
+        super().__init__()
+        self.patch_size = patch_size
+        self.c = out_channels
+
+        # eps is default in mmdit.py
+        self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.linear = nn.Linear(hidden_size, patch_size**2 * out_channels)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 2 * hidden_size),
+        )
+
+    def forward(self, x: torch.Tensor, cmod, H=None, W=None):
+        b, n, _ = x.shape
+        p = self.patch_size
+        c = self.c
+        if H is None and W is None:
+            w = h = int(n**0.5)
+            assert h * w == n
+        else:
+            h = H // p if H else n // (W // p)
+            w = W // p if W else n // h
+            assert h * w == n
+
+        shift, scale = self.adaLN_modulation(cmod).chunk(2, dim=-1)
+        x = modulate(self.norm_final(x), shift, scale)
+        x = self.linear(x)
+
+        x = x.view(b, h, w, p, p, c)
+        x = x.permute(0, 5, 1, 3, 2, 4).contiguous()
+        x = x.view(b, c, h * p, w * p)
+        return x
+
+
+class MLP(nn.Module):
+    def __init__(
+        self,
+        in_features,
+        hidden_features=None,
+        out_features=None,
+        act_layer=lambda: nn.GELU(),
+        norm_layer=None,
+        bias=True,
+        use_conv=False,
+    ):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.use_conv = use_conv
+
+        layer = partial(nn.Conv1d, kernel_size=1) if use_conv else nn.Linear
+
+        self.fc1 = layer(in_features, hidden_features, bias=bias)
+        self.fc2 = layer(hidden_features, out_features, bias=bias)
+        self.act = act_layer()
+        self.norm = norm_layer(hidden_features) if norm_layer else nn.Identity()
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.norm(x)
+        x = self.fc2(x)
+        return x
+
+
+class TimestepEmbedding(nn.Module):
+    def __init__(self, hidden_size, freq_embed_size=256):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(freq_embed_size, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size),
+        )
+        self.freq_embed_size = freq_embed_size
+
+    def forward(self, t, dtype=None, **kwargs):
+        t_freq = timestep_embedding(t, self.freq_embed_size).to(dtype)
+        t_emb = self.mlp(t_freq)
+        return t_emb
+
+
+class Embedder(nn.Module):
+    def __init__(self, input_dim, hidden_size):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size),
+        )
+
+    def forward(self, x):
+        return self.mlp(x)
+
+
+def rmsnorm(x, eps=1e-6):
+    return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
+
+
+class RMSNorm(torch.nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        elementwise_affine: bool = False,
+        eps: float = 1e-6,
+        device=None,
+        dtype=None,
+    ):
+        """
+        Initialize the RMSNorm normalization layer.
+        Args:
+            dim (int): The dimension of the input tensor.
+            eps (float, optional): A small value added to the denominator for numerical stability. Default is 1e-6.
+        Attributes:
+            eps (float): A small value added to the denominator for numerical stability.
+            weight (nn.Parameter): Learnable scaling parameter.
+        """
+        super().__init__()
+        self.eps = eps
+        self.learnable_scale = elementwise_affine
+        if self.learnable_scale:
+            self.weight = nn.Parameter(torch.empty(dim, device=device, dtype=dtype))
+        else:
+            self.register_parameter("weight", None)
+
+    def forward(self, x):
+        """
+        Forward pass through the RMSNorm layer.
+        Args:
+            x (torch.Tensor): The input tensor.
+        Returns:
+            torch.Tensor: The output tensor after applying RMSNorm.
+        """
+        x = rmsnorm(x, eps=self.eps)
+        if self.learnable_scale:
+            return x * self.weight.to(device=x.device, dtype=x.dtype)
+        else:
+            return x
+
+
+class SwiGLUFeedForward(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        hidden_dim: int,
+        multiple_of: int,
+        ffn_dim_multiplier: float = None,
+    ):
+        super().__init__()
+        hidden_dim = int(2 * hidden_dim / 3)
+        # custom dim factor multiplier
+        if ffn_dim_multiplier is not None:
+            hidden_dim = int(ffn_dim_multiplier * hidden_dim)
+        hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
+
+        self.w1 = nn.Linear(dim, hidden_dim, bias=False)
+        self.w2 = nn.Linear(hidden_dim, dim, bias=False)
+        self.w3 = nn.Linear(dim, hidden_dim, bias=False)
+
+    def forward(self, x):
+        return self.w2(nn.functional.silu(self.w1(x)) * self.w3(x))
+
+
+# Linears for SelfAttention in mmdit.py
+class AttentionLinears(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 8,
+        qkv_bias: bool = False,
+        pre_only: bool = False,
+        qk_norm: Optional[str] = None,
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        if not pre_only:
+            self.proj = nn.Linear(dim, dim)
+        self.pre_only = pre_only
+
+        if qk_norm == "rms":
+            self.ln_q = RMSNorm(self.head_dim, elementwise_affine=True, eps=1.0e-6)
+            self.ln_k = RMSNorm(self.head_dim, elementwise_affine=True, eps=1.0e-6)
+        elif qk_norm == "ln":
+            self.ln_q = nn.LayerNorm(self.head_dim, elementwise_affine=True, eps=1.0e-6)
+            self.ln_k = nn.LayerNorm(self.head_dim, elementwise_affine=True, eps=1.0e-6)
+        elif qk_norm is None:
+            self.ln_q = nn.Identity()
+            self.ln_k = nn.Identity()
+        else:
+            raise ValueError(qk_norm)
+
+    def pre_attention(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        output:
+            q, k, v: [B, L, D]
+        """
+        B, L, C = x.shape
+        qkv: torch.Tensor = self.qkv(x)
+        q, k, v = qkv.reshape(B, L, -1, self.head_dim).chunk(3, dim=2)
+        q = self.ln_q(q).reshape(q.shape[0], q.shape[1], -1)
+        k = self.ln_k(k).reshape(q.shape[0], q.shape[1], -1)
+        return (q, k, v)
+
+    def post_attention(self, x: torch.Tensor) -> torch.Tensor:
+        assert not self.pre_only
+        x = self.proj(x)
+        return x
+
+
+MEMORY_LAYOUTS = {
+    "torch": (
+        lambda x, head_dim: x.reshape(x.shape[0], x.shape[1], -1, head_dim).transpose(1, 2),
+        lambda x: x.transpose(1, 2).reshape(x.shape[0], x.shape[2], -1),
+        lambda x: (1, x, 1, 1),
+    ),
+    "xformers": (
+        lambda x, head_dim: x.reshape(x.shape[0], x.shape[1], -1, head_dim),
+        lambda x: x.reshape(x.shape[0], x.shape[1], -1),
+        lambda x: (1, 1, x, 1),
+    ),
+    "math": (
+        lambda x, head_dim: x.reshape(x.shape[0], x.shape[1], -1, head_dim).transpose(1, 2),
+        lambda x: x.transpose(1, 2).reshape(x.shape[0], x.shape[2], -1),
+        lambda x: (1, x, 1, 1),
+    ),
+}
+# ATTN_FUNCTION = {
+#     "torch": F.scaled_dot_product_attention,
+#     "xformers": memory_efficient_attention,
+# }
+
+
+def vanilla_attention(q, k, v, mask, scale=None):
+    if scale is None:
+        scale = math.sqrt(q.size(-1))
+    scores = torch.bmm(q, k.transpose(-1, -2)) / scale
+    if mask is not None:
+        mask = einops.rearrange(mask, "b ... -> b (...)")
+        max_neg_value = -torch.finfo(scores.dtype).max
+        mask = einops.repeat(mask, "b j -> (b h) j", h=q.size(-3))
+        scores = scores.masked_fill(~mask, max_neg_value)
+    p_attn = F.softmax(scores, dim=-1)
+    return torch.bmm(p_attn, v)
+
+
+def attention(q, k, v, head_dim, mask=None, scale=None, mode="xformers"):
+    """
+    q, k, v: [B, L, D]
+    """
+    pre_attn_layout = MEMORY_LAYOUTS[mode][0]
+    post_attn_layout = MEMORY_LAYOUTS[mode][1]
+    q = pre_attn_layout(q, head_dim)
+    k = pre_attn_layout(k, head_dim)
+    v = pre_attn_layout(v, head_dim)
+
+    # scores = ATTN_FUNCTION[mode](q, k.to(q), v.to(q), mask, scale=scale)
+    if mode == "torch":
+        assert scale is None
+        scores = F.scaled_dot_product_attention(q, k.to(q), v.to(q), mask)  # , scale=scale)
+    elif mode == "xformers":
+        scores = memory_efficient_attention(q, k.to(q), v.to(q), mask, scale=scale)
+    else:
+        scores = vanilla_attention(q, k.to(q), v.to(q), mask, scale=scale)
+
+    scores = post_attn_layout(scores)
+    return scores
+
+
+# DismantledBlock in mmdit.py
+class SingleDiTBlock(nn.Module):
+    """
+    A DiT block with gated adaptive layer norm (adaLN) conditioning.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        mlp_ratio: float = 4.0,
+        attn_mode: str = "xformers",
+        qkv_bias: bool = False,
+        pre_only: bool = False,
+        rmsnorm: bool = False,
+        scale_mod_only: bool = False,
+        swiglu: bool = False,
+        qk_norm: Optional[str] = None,
+        x_block_self_attn: bool = False,
+        **block_kwargs,
+    ):
+        super().__init__()
+        assert attn_mode in MEMORY_LAYOUTS
+        self.attn_mode = attn_mode
+        if not rmsnorm:
+            self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        else:
+            self.norm1 = RMSNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.attn = AttentionLinears(dim=hidden_size, num_heads=num_heads, qkv_bias=qkv_bias, pre_only=pre_only, qk_norm=qk_norm)
+
+        self.x_block_self_attn = x_block_self_attn
+        if self.x_block_self_attn:
+            assert not pre_only
+            assert not scale_mod_only
+            self.attn2 = AttentionLinears(dim=hidden_size, num_heads=num_heads, qkv_bias=qkv_bias, pre_only=False, qk_norm=qk_norm)
+
+        if not pre_only:
+            if not rmsnorm:
+                self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+            else:
+                self.norm2 = RMSNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        if not pre_only:
+            if not swiglu:
+                self.mlp = MLP(
+                    in_features=hidden_size,
+                    hidden_features=mlp_hidden_dim,
+                    act_layer=lambda: nn.GELU(approximate="tanh"),
+                )
+            else:
+                self.mlp = SwiGLUFeedForward(
+                    dim=hidden_size,
+                    hidden_dim=mlp_hidden_dim,
+                    multiple_of=256,
+                )
+        self.scale_mod_only = scale_mod_only
+        if self.x_block_self_attn:
+            n_mods = 9
+        elif not scale_mod_only:
+            n_mods = 6 if not pre_only else 2
+        else:
+            n_mods = 4 if not pre_only else 1
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, n_mods * hidden_size))
+        self.pre_only = pre_only
+
+    def pre_attention(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        if not self.pre_only:
+            if not self.scale_mod_only:
+                (shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp) = self.adaLN_modulation(c).chunk(6, dim=-1)
+            else:
+                shift_msa = None
+                shift_mlp = None
+                (scale_msa, gate_msa, scale_mlp, gate_mlp) = self.adaLN_modulation(c).chunk(4, dim=-1)
+            qkv = self.attn.pre_attention(modulate(self.norm1(x), shift_msa, scale_msa))
+            return qkv, (x, gate_msa, shift_mlp, scale_mlp, gate_mlp)
+        else:
+            if not self.scale_mod_only:
+                (shift_msa, scale_msa) = self.adaLN_modulation(c).chunk(2, dim=-1)
+            else:
+                shift_msa = None
+                scale_msa = self.adaLN_modulation(c)
+            qkv = self.attn.pre_attention(modulate(self.norm1(x), shift_msa, scale_msa))
+            return qkv, None
+
+    def pre_attention_x(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        assert self.x_block_self_attn
+        (shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp, shift_msa2, scale_msa2, gate_msa2) = self.adaLN_modulation(
+            c
+        ).chunk(9, dim=1)
+        x_norm = self.norm1(x)
+        qkv = self.attn.pre_attention(modulate(x_norm, shift_msa, scale_msa))
+        qkv2 = self.attn2.pre_attention(modulate(x_norm, shift_msa2, scale_msa2))
+        return qkv, qkv2, (x, gate_msa, shift_mlp, scale_mlp, gate_mlp, gate_msa2)
+
+    def post_attention(self, attn, x, gate_msa, shift_mlp, scale_mlp, gate_mlp):
+        assert not self.pre_only
+        x = x + gate_msa.unsqueeze(1) * self.attn.post_attention(attn)
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        return x
+
+    def post_attention_x(self, attn, attn2, x, gate_msa, shift_mlp, scale_mlp, gate_mlp, gate_msa2, attn1_dropout: float = 0.0):
+        assert not self.pre_only
+        if attn1_dropout > 0.0:
+            # Use torch.bernoulli to implement dropout, only dropout the batch dimension
+            attn1_dropout = torch.bernoulli(torch.full((attn.size(0), 1, 1), 1 - attn1_dropout, device=attn.device))
+            attn_ = gate_msa.unsqueeze(1) * self.attn.post_attention(attn) * attn1_dropout
+        else:
+            attn_ = gate_msa.unsqueeze(1) * self.attn.post_attention(attn)
+        x = x + attn_
+        attn2_ = gate_msa2.unsqueeze(1) * self.attn2.post_attention(attn2)
+        x = x + attn2_
+        mlp_ = gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        x = x + mlp_
+        return x
+
+
+# JointBlock + block_mixing in mmdit.py
+class MMDiTBlock(nn.Module):
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        pre_only = kwargs.pop("pre_only")
+        x_block_self_attn = kwargs.pop("x_block_self_attn")
+
+        self.context_block = SingleDiTBlock(*args, pre_only=pre_only, **kwargs)
+        self.x_block = SingleDiTBlock(*args, pre_only=False, x_block_self_attn=x_block_self_attn, **kwargs)
+
+        self.head_dim = self.x_block.attn.head_dim
+        self.mode = self.x_block.attn_mode
+        self.gradient_checkpointing = False
+
+    def enable_gradient_checkpointing(self):
+        self.gradient_checkpointing = True
+
+    def _forward(self, context, x, c):
+        ctx_qkv, ctx_intermediate = self.context_block.pre_attention(context, c)
+
+        if self.x_block.x_block_self_attn:
+            x_qkv, x_qkv2, x_intermediates = self.x_block.pre_attention_x(x, c)
+        else:
+            x_qkv, x_intermediates = self.x_block.pre_attention(x, c)
+
+        ctx_len = ctx_qkv[0].size(1)
+
+        q = torch.concat((ctx_qkv[0], x_qkv[0]), dim=1)
+        k = torch.concat((ctx_qkv[1], x_qkv[1]), dim=1)
+        v = torch.concat((ctx_qkv[2], x_qkv[2]), dim=1)
+
+        attn = attention(q, k, v, head_dim=self.head_dim, mode=self.mode)
+        ctx_attn_out = attn[:, :ctx_len]
+        x_attn_out = attn[:, ctx_len:]
+
+        if self.x_block.x_block_self_attn:
+            x_q2, x_k2, x_v2 = x_qkv2
+            attn2 = attention(x_q2, x_k2, x_v2, self.x_block.attn2.num_heads, mode=self.mode)
+            x = self.x_block.post_attention_x(x_attn_out, attn2, *x_intermediates)
+        else:
+            x = self.x_block.post_attention(x_attn_out, *x_intermediates)
+
+        if not self.context_block.pre_only:
+            context = self.context_block.post_attention(ctx_attn_out, *ctx_intermediate)
+        else:
+            context = None
+
+        return context, x
+
+    def forward(self, *args, **kwargs):
+        if self.training and self.gradient_checkpointing:
+            return checkpoint(self._forward, *args, use_reentrant=False, **kwargs)
+        else:
+            return self._forward(*args, **kwargs)
+
+
+class MMDiT(nn.Module):
+    """
+    Diffusion model with a Transformer backbone.
+    """
+
+    # prepare pos_embed for latent size * 2
+    POS_EMBED_MAX_RATIO = 1.5
+
+    def __init__(
+        self,
+        input_size: int = 32,
+        patch_size: int = 2,
+        in_channels: int = 4,
+        depth: int = 28,
+        # hidden_size: Optional[int] = None,
+        # num_heads: Optional[int] = None,
+        mlp_ratio: float = 4.0,
+        learn_sigma: bool = False,
+        adm_in_channels: Optional[int] = None,
+        context_embedder_in_features: Optional[int] = None,
+        context_embedder_out_features: Optional[int] = None,
+        use_checkpoint: bool = False,
+        register_length: int = 0,
+        attn_mode: str = "torch",
+        rmsnorm: bool = False,
+        scale_mod_only: bool = False,
+        swiglu: bool = False,
+        out_channels: Optional[int] = None,
+        pos_embed_scaling_factor: Optional[float] = None,
+        pos_embed_offset: Optional[float] = None,
+        pos_embed_max_size: Optional[int] = None,
+        num_patches=None,
+        qk_norm: Optional[str] = None,
+        x_block_self_attn_layers: Optional[list[int]] = [],
+        qkv_bias: bool = True,
+        pos_emb_random_crop_rate: float = 0.0,
+        use_scaled_pos_embed: bool = False,
+        pos_embed_latent_sizes: Optional[list[int]] = None,
+        model_type: str = "sd3m",
+    ):
+        super().__init__()
+        self._model_type = model_type
+        self.learn_sigma = learn_sigma
+        self.in_channels = in_channels
+        default_out_channels = in_channels * 2 if learn_sigma else in_channels
+        self.out_channels = default(out_channels, default_out_channels)
+        self.patch_size = patch_size
+        self.pos_embed_scaling_factor = pos_embed_scaling_factor
+        self.pos_embed_offset = pos_embed_offset
+        self.pos_embed_max_size = pos_embed_max_size
+        self.x_block_self_attn_layers = x_block_self_attn_layers
+        self.pos_emb_random_crop_rate = pos_emb_random_crop_rate
+        self.gradient_checkpointing = use_checkpoint
+
+        # hidden_size = default(hidden_size, 64 * depth)
+        # num_heads = default(num_heads, hidden_size // 64)
+
+        # apply magic --> this defines a head_size of 64
+        self.hidden_size = 64 * depth
+        num_heads = depth
+
+        self.num_heads = num_heads
+
+        self.enable_scaled_pos_embed(use_scaled_pos_embed, pos_embed_latent_sizes)
+
+        self.x_embedder = PatchEmbed(
+            input_size,
+            patch_size,
+            in_channels,
+            self.hidden_size,
+            bias=True,
+            strict_img_size=self.pos_embed_max_size is None,
+        )
+        self.t_embedder = TimestepEmbedding(self.hidden_size)
+
+        self.y_embedder = None
+        if adm_in_channels is not None:
+            assert isinstance(adm_in_channels, int)
+            self.y_embedder = Embedder(adm_in_channels, self.hidden_size)
+
+        if context_embedder_in_features is not None:
+            self.context_embedder = nn.Linear(context_embedder_in_features, context_embedder_out_features)
+        else:
+            self.context_embedder = nn.Identity()
+
+        self.register_length = register_length
+        if self.register_length > 0:
+            self.register = nn.Parameter(torch.randn(1, register_length, self.hidden_size))
+
+        # num_patches = self.x_embedder.num_patches
+        # Will use fixed sin-cos embedding:
+        # just use a buffer already
+        if num_patches is not None:
+            self.register_buffer(
+                "pos_embed",
+                torch.empty(1, num_patches, self.hidden_size),
+            )
+        else:
+            self.pos_embed = None
+
+        self.use_checkpoint = use_checkpoint
+        self.joint_blocks = nn.ModuleList(
+            [
+                MMDiTBlock(
+                    self.hidden_size,
+                    num_heads,
+                    mlp_ratio=mlp_ratio,
+                    attn_mode=attn_mode,
+                    qkv_bias=qkv_bias,
+                    pre_only=i == depth - 1,
+                    rmsnorm=rmsnorm,
+                    scale_mod_only=scale_mod_only,
+                    swiglu=swiglu,
+                    qk_norm=qk_norm,
+                    x_block_self_attn=(i in self.x_block_self_attn_layers),
+                )
+                for i in range(depth)
+            ]
+        )
+        for block in self.joint_blocks:
+            block.gradient_checkpointing = use_checkpoint
+
+        self.final_layer = UnPatch(self.hidden_size, patch_size, self.out_channels)
+        # self.initialize_weights()
+
+        self.blocks_to_swap = None
+        self.offloader = None
+        self.num_blocks = len(self.joint_blocks)
+
+    def enable_scaled_pos_embed(self, use_scaled_pos_embed: bool, latent_sizes: Optional[list[int]]):
+        self.use_scaled_pos_embed = use_scaled_pos_embed
+
+        if self.use_scaled_pos_embed:
+            # # remove pos_embed to free up memory up to 0.4 GB -> this causes error because pos_embed is not saved
+            # self.pos_embed = None
+            # move pos_embed to CPU to free up memory up to 0.4 GB
+            self.pos_embed = self.pos_embed.cpu()
+
+            # remove duplicates and sort latent sizes in ascending order
+            latent_sizes = list(set(latent_sizes))
+            latent_sizes = sorted(latent_sizes)
+
+            patched_sizes = [latent_size // self.patch_size for latent_size in latent_sizes]
+
+            # calculate value range for each latent area: this is used to determine the pos_emb size from the latent shape
+            max_areas = []
+            for i in range(1, len(patched_sizes)):
+                prev_area = patched_sizes[i - 1] ** 2
+                area = patched_sizes[i] ** 2
+                max_areas.append((prev_area + area) // 2)
+
+            # area of the last latent size, if the latent size exceeds this, error will be raised
+            max_areas.append(int((patched_sizes[-1] * MMDiT.POS_EMBED_MAX_RATIO) ** 2))
+            # print("max_areas", max_areas)
+
+            self.resolution_area_to_latent_size = [(area, latent_size) for area, latent_size in zip(max_areas, patched_sizes)]
+
+            self.resolution_pos_embeds = {}
+            for patched_size in patched_sizes:
+                grid_size = int(patched_size * MMDiT.POS_EMBED_MAX_RATIO)
+                pos_embed = get_scaled_2d_sincos_pos_embed(self.hidden_size, grid_size, sample_size=patched_size)
+                pos_embed = torch.from_numpy(pos_embed).float().unsqueeze(0)
+                self.resolution_pos_embeds[patched_size] = pos_embed
+                # print(f"pos_embed for {patched_size}x{patched_size} latent size: {pos_embed.shape}")
+
+        else:
+            self.resolution_area_to_latent_size = None
+            self.resolution_pos_embeds = None
+
+    @property
+    def model_type(self):
+        return self._model_type
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
+    @property
+    def dtype(self):
+        return next(self.parameters()).dtype
+
+    def enable_gradient_checkpointing(self):
+        self.gradient_checkpointing = True
+        for block in self.joint_blocks:
+            block.enable_gradient_checkpointing()
+
+    def disable_gradient_checkpointing(self):
+        self.gradient_checkpointing = False
+        for block in self.joint_blocks:
+            block.disable_gradient_checkpointing()
+
+    def initialize_weights(self):
+        # TODO: Init context_embedder?
+        # Initialize transformer layers:
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+
+        self.apply(_basic_init)
+
+        # Initialize (and freeze) pos_embed by sin-cos embedding
+        if self.pos_embed is not None:
+            pos_embed = get_2d_sincos_pos_embed(
+                self.pos_embed.shape[-1],
+                int(self.pos_embed.shape[-2] ** 0.5),
+                scaling_factor=self.pos_embed_scaling_factor,
+            )
+            self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+
+        # Initialize patch_embed like nn.Linear (instead of nn.Conv2d)
+        w = self.x_embedder.proj.weight.data
+        nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+        nn.init.constant_(self.x_embedder.proj.bias, 0)
+
+        if getattr(self, "y_embedder", None) is not None:
+            nn.init.normal_(self.y_embedder.mlp[0].weight, std=0.02)
+            nn.init.normal_(self.y_embedder.mlp[2].weight, std=0.02)
+
+        # Initialize timestep embedding MLP:
+        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
+        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
+
+        # Zero-out adaLN modulation layers in DiT blocks:
+        for block in self.joint_blocks:
+            nn.init.constant_(block.x_block.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(block.x_block.adaLN_modulation[-1].bias, 0)
+            nn.init.constant_(block.context_block.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(block.context_block.adaLN_modulation[-1].bias, 0)
+
+        # Zero-out output layers:
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
+        nn.init.constant_(self.final_layer.linear.weight, 0)
+        nn.init.constant_(self.final_layer.linear.bias, 0)
+
+    def set_pos_emb_random_crop_rate(self, rate: float):
+        self.pos_emb_random_crop_rate = rate
+
+    def cropped_pos_embed(self, h, w, device=None, random_crop: bool = False):
+        p = self.x_embedder.patch_size
+        # patched size
+        h = (h + 1) // p
+        w = (w + 1) // p
+        if self.pos_embed is None:  # should not happen
+            return get_2d_sincos_pos_embed_torch(self.hidden_size, w, h, device=device)
+        assert self.pos_embed_max_size is not None
+        assert h <= self.pos_embed_max_size, (h, self.pos_embed_max_size)
+        assert w <= self.pos_embed_max_size, (w, self.pos_embed_max_size)
+
+        if not random_crop:
+            top = (self.pos_embed_max_size - h) // 2
+            left = (self.pos_embed_max_size - w) // 2
+        else:
+            top = torch.randint(0, self.pos_embed_max_size - h + 1, (1,)).item()
+            left = torch.randint(0, self.pos_embed_max_size - w + 1, (1,)).item()
+
+        spatial_pos_embed = self.pos_embed.reshape(
+            1,
+            self.pos_embed_max_size,
+            self.pos_embed_max_size,
+            self.pos_embed.shape[-1],
+        )
+        spatial_pos_embed = spatial_pos_embed[:, top : top + h, left : left + w, :]
+        spatial_pos_embed = spatial_pos_embed.reshape(1, -1, spatial_pos_embed.shape[-1])
+        return spatial_pos_embed
+
+    def cropped_scaled_pos_embed(self, h, w, device=None, dtype=None, random_crop: bool = False):
+        p = self.x_embedder.patch_size
+        # patched size
+        h = (h + 1) // p
+        w = (w + 1) // p
+
+        # select pos_embed size based on area
+        area = h * w
+        patched_size = None
+        for area_, patched_size_ in self.resolution_area_to_latent_size:
+            if area <= area_:
+                patched_size = patched_size_
+                break
+        if patched_size is None:
+            # raise ValueError(f"Area {area} is too large for the given latent sizes {self.resolution_area_to_latent_size}.")
+            # use largest latent size
+            patched_size = self.resolution_area_to_latent_size[-1][1]
+
+        pos_embed = self.resolution_pos_embeds[patched_size]
+        pos_embed_size = round(math.sqrt(pos_embed.shape[1]))  # max size, patched_size * POS_EMBED_MAX_RATIO
+        if h > pos_embed_size or w > pos_embed_size:
+            # # fallback to normal pos_embed
+            # return self.cropped_pos_embed(h * p, w * p, device=device, random_crop=random_crop)
+            # extend pos_embed size
+            logger.warning(
+                f"Add new pos_embed for size {h}x{w} as it exceeds the scaled pos_embed size {pos_embed_size}. Image is too tall or wide."
+            )
+            patched_size = max(h, w)
+            grid_size = int(patched_size * MMDiT.POS_EMBED_MAX_RATIO)
+            pos_embed_size = grid_size
+            pos_embed = get_scaled_2d_sincos_pos_embed(self.hidden_size, grid_size, sample_size=patched_size)
+            pos_embed = torch.from_numpy(pos_embed).float().unsqueeze(0)
+            self.resolution_pos_embeds[patched_size] = pos_embed
+            logger.info(f"Added pos_embed for size {patched_size}x{patched_size}")
+
+            # print(torch.allclose(pos_embed.to(torch.float32).cpu(), self.pos_embed.to(torch.float32).cpu(), atol=5e-2))
+            # diff = pos_embed.to(torch.float32).cpu() - self.pos_embed.to(torch.float32).cpu()
+            # print(diff.abs().max(), diff.abs().mean())
+
+            # insert to resolution_area_to_latent_size, by adding and sorting
+            area = pos_embed_size**2
+            self.resolution_area_to_latent_size.append((area, patched_size))
+            self.resolution_area_to_latent_size = sorted(self.resolution_area_to_latent_size)
+
+        if not random_crop:
+            top = (pos_embed_size - h) // 2
+            left = (pos_embed_size - w) // 2
+        else:
+            top = torch.randint(0, pos_embed_size - h + 1, (1,)).item()
+            left = torch.randint(0, pos_embed_size - w + 1, (1,)).item()
+
+        if pos_embed.device != device:
+            pos_embed = pos_embed.to(device)
+            # which is better to update device, or transfer every time to device? -> 64x64 emb is 96*96*1536*4=56MB. It's okay to update device.
+            self.resolution_pos_embeds[patched_size] = pos_embed  # update device
+        if pos_embed.dtype != dtype:
+            pos_embed = pos_embed.to(dtype)
+            self.resolution_pos_embeds[patched_size] = pos_embed  # update dtype
+
+        spatial_pos_embed = pos_embed.reshape(1, pos_embed_size, pos_embed_size, pos_embed.shape[-1])
+        spatial_pos_embed = spatial_pos_embed[:, top : top + h, left : left + w, :]
+        spatial_pos_embed = spatial_pos_embed.reshape(1, -1, spatial_pos_embed.shape[-1])
+        # print(
+        #     f"patched size: {h}x{w}, pos_embed size: {pos_embed_size}, pos_embed shape: {pos_embed.shape}, top: {top}, left: {left}"
+        # )
+        return spatial_pos_embed
+
+    def enable_block_swap(self, num_blocks: int, device: torch.device):
+        self.blocks_to_swap = num_blocks
+
+        assert (
+            self.blocks_to_swap <= self.num_blocks - 2
+        ), f"Cannot swap more than {self.num_blocks - 2} blocks. Requested: {self.blocks_to_swap} blocks."
+
+        self.offloader = custom_offloading_utils.ModelOffloader(
+            self.joint_blocks, self.blocks_to_swap, device  # , debug=True
+        )
+        print(f"SD3: Block swap enabled. Swapping {num_blocks} blocks, total blocks: {self.num_blocks}, device: {device}.")
+
+    def move_to_device_except_swap_blocks(self, device: torch.device):
+        # assume model is on cpu. do not move blocks to device to reduce temporary memory usage
+        if self.blocks_to_swap:
+            save_blocks = self.joint_blocks
+            self.joint_blocks = nn.ModuleList()
+
+        self.to(device)
+
+        if self.blocks_to_swap:
+            self.joint_blocks = save_blocks
+
+    def prepare_block_swap_before_forward(self):
+        if self.blocks_to_swap is None or self.blocks_to_swap == 0:
+            return
+        self.offloader.prepare_block_devices_before_forward(self.joint_blocks)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        y: Optional[torch.Tensor] = None,
+        context: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Forward pass of DiT.
+        x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
+        t: (N,) tensor of diffusion timesteps
+        y: (N, D) tensor of class labels
+        """
+        pos_emb_random_crop = (
+            False if self.pos_emb_random_crop_rate == 0.0 else torch.rand(1).item() < self.pos_emb_random_crop_rate
+        )
+
+        B, C, H, W = x.shape
+
+        # x = self.x_embedder(x) + self.cropped_pos_embed(H, W, device=x.device, random_crop=pos_emb_random_crop).to(dtype=x.dtype)
+        if not self.use_scaled_pos_embed:
+            pos_embed = self.cropped_pos_embed(H, W, device=x.device, random_crop=pos_emb_random_crop).to(dtype=x.dtype)
+        else:
+            # print(f"Using scaled pos_embed for size {H}x{W}")
+            pos_embed = self.cropped_scaled_pos_embed(H, W, device=x.device, dtype=x.dtype, random_crop=pos_emb_random_crop)
+        x = self.x_embedder(x) + pos_embed
+        del pos_embed
+
+        c = self.t_embedder(t, dtype=x.dtype)  # (N, D)
+        if y is not None and self.y_embedder is not None:
+            y = self.y_embedder(y)  # (N, D)
+            c = c + y  # (N, D)
+
+        if context is not None:
+            context = self.context_embedder(context)
+
+        if self.register_length > 0:
+            context = torch.cat(
+                (einops.repeat(self.register, "1 ... -> b ...", b=x.shape[0]), default(context, torch.Tensor([]).type_as(x))), 1
+            )
+
+        if not self.blocks_to_swap:
+            for block in self.joint_blocks:
+                context, x = block(context, x, c)
+        else:
+            for block_idx, block in enumerate(self.joint_blocks):
+                self.offloader.wait_for_block(block_idx)
+
+                context, x = block(context, x, c)
+
+                self.offloader.submit_move_blocks(self.joint_blocks, block_idx)
+
+        x = self.final_layer(x, c, H, W)  # Our final layer combined UnPatchify
+        return x[:, :, :H, :W]
+
+
+def create_sd3_mmdit(params: SD3Params, attn_mode: str = "torch") -> MMDiT:
+    mmdit = MMDiT(
+        input_size=None,
+        pos_embed_max_size=params.pos_embed_max_size,
+        patch_size=params.patch_size,
+        in_channels=16,
+        adm_in_channels=params.adm_in_channels,
+        context_embedder_in_features=params.context_embedder_in_features,
+        context_embedder_out_features=params.context_embedder_out_features,
+        depth=params.depth,
+        mlp_ratio=4,
+        qk_norm=params.qk_norm,
+        x_block_self_attn_layers=params.x_block_self_attn_layers,
+        num_patches=params.num_patches,
+        attn_mode=attn_mode,
+        model_type=params.model_type,
+    )
+    return mmdit
+
+
+# endregion
+
+# region VAE
+
+VAE_SCALE_FACTOR = 1.5305
+VAE_SHIFT_FACTOR = 0.0609
+
+
+def Normalize(in_channels, num_groups=32, dtype=torch.float32, device=None):
+    return torch.nn.GroupNorm(num_groups=num_groups, num_channels=in_channels, eps=1e-6, affine=True, dtype=dtype, device=device)
+
+
+class ResnetBlock(torch.nn.Module):
+    def __init__(self, *, in_channels, out_channels=None, dtype=torch.float32, device=None):
+        super().__init__()
+        self.in_channels = in_channels
+        out_channels = in_channels if out_channels is None else out_channels
+        self.out_channels = out_channels
+
+        self.norm1 = Normalize(in_channels, dtype=dtype, device=device)
+        self.conv1 = torch.nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1, dtype=dtype, device=device)
+        self.norm2 = Normalize(out_channels, dtype=dtype, device=device)
+        self.conv2 = torch.nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, dtype=dtype, device=device)
+        if self.in_channels != self.out_channels:
+            self.nin_shortcut = torch.nn.Conv2d(
+                in_channels, out_channels, kernel_size=1, stride=1, padding=0, dtype=dtype, device=device
+            )
+        else:
+            self.nin_shortcut = None
+        self.swish = torch.nn.SiLU(inplace=True)
+
+    def forward(self, x):
+        hidden = x
+        hidden = self.norm1(hidden)
+        hidden = self.swish(hidden)
+        hidden = self.conv1(hidden)
+        hidden = self.norm2(hidden)
+        hidden = self.swish(hidden)
+        hidden = self.conv2(hidden)
+        if self.in_channels != self.out_channels:
+            x = self.nin_shortcut(x)
+        return x + hidden
+
+
+class AttnBlock(torch.nn.Module):
+    def __init__(self, in_channels, dtype=torch.float32, device=None):
+        super().__init__()
+        self.norm = Normalize(in_channels, dtype=dtype, device=device)
+        self.q = torch.nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0, dtype=dtype, device=device)
+        self.k = torch.nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0, dtype=dtype, device=device)
+        self.v = torch.nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0, dtype=dtype, device=device)
+        self.proj_out = torch.nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0, dtype=dtype, device=device)
+
+    def forward(self, x):
+        hidden = self.norm(x)
+        q = self.q(hidden)
+        k = self.k(hidden)
+        v = self.v(hidden)
+        b, c, h, w = q.shape
+        q, k, v = map(lambda x: einops.rearrange(x, "b c h w -> b 1 (h w) c").contiguous(), (q, k, v))
+        hidden = torch.nn.functional.scaled_dot_product_attention(q, k, v)  # scale is dim ** -0.5 per default
+        hidden = einops.rearrange(hidden, "b 1 (h w) c -> b c h w", h=h, w=w, c=c, b=b)
+        hidden = self.proj_out(hidden)
+        return x + hidden
+
+
+class Downsample(torch.nn.Module):
+    def __init__(self, in_channels, dtype=torch.float32, device=None):
+        super().__init__()
+        self.conv = torch.nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=2, padding=0, dtype=dtype, device=device)
+
+    def forward(self, x):
+        pad = (0, 1, 0, 1)
+        x = torch.nn.functional.pad(x, pad, mode="constant", value=0)
+        x = self.conv(x)
+        return x
+
+
+class Upsample(torch.nn.Module):
+    def __init__(self, in_channels, dtype=torch.float32, device=None):
+        super().__init__()
+        self.conv = torch.nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1, dtype=dtype, device=device)
+
+    def forward(self, x):
+        org_dtype = x.dtype
+        if x.dtype == torch.bfloat16:
+            x = x.to(torch.float32)
+        x = torch.nn.functional.interpolate(x, scale_factor=2.0, mode="nearest")
+        if x.dtype != org_dtype:
+            x = x.to(org_dtype)
+        x = self.conv(x)
+        return x
+
+
+class VAEEncoder(torch.nn.Module):
+    def __init__(
+        self, ch=128, ch_mult=(1, 2, 4, 4), num_res_blocks=2, in_channels=3, z_channels=16, dtype=torch.float32, device=None
+    ):
+        super().__init__()
+        self.num_resolutions = len(ch_mult)
+        self.num_res_blocks = num_res_blocks
+        # downsampling
+        self.conv_in = torch.nn.Conv2d(in_channels, ch, kernel_size=3, stride=1, padding=1, dtype=dtype, device=device)
+        in_ch_mult = (1,) + tuple(ch_mult)
+        self.in_ch_mult = in_ch_mult
+        self.down = torch.nn.ModuleList()
+        for i_level in range(self.num_resolutions):
+            block = torch.nn.ModuleList()
+            attn = torch.nn.ModuleList()
+            block_in = ch * in_ch_mult[i_level]
+            block_out = ch * ch_mult[i_level]
+            for i_block in range(num_res_blocks):
+                block.append(ResnetBlock(in_channels=block_in, out_channels=block_out, dtype=dtype, device=device))
+                block_in = block_out
+            down = torch.nn.Module()
+            down.block = block
+            down.attn = attn
+            if i_level != self.num_resolutions - 1:
+                down.downsample = Downsample(block_in, dtype=dtype, device=device)
+            self.down.append(down)
+        # middle
+        self.mid = torch.nn.Module()
+        self.mid.block_1 = ResnetBlock(in_channels=block_in, out_channels=block_in, dtype=dtype, device=device)
+        self.mid.attn_1 = AttnBlock(block_in, dtype=dtype, device=device)
+        self.mid.block_2 = ResnetBlock(in_channels=block_in, out_channels=block_in, dtype=dtype, device=device)
+        # end
+        self.norm_out = Normalize(block_in, dtype=dtype, device=device)
+        self.conv_out = torch.nn.Conv2d(block_in, 2 * z_channels, kernel_size=3, stride=1, padding=1, dtype=dtype, device=device)
+        self.swish = torch.nn.SiLU(inplace=True)
+
+    def forward(self, x):
+        # downsampling
+        hs = [self.conv_in(x)]
+        for i_level in range(self.num_resolutions):
+            for i_block in range(self.num_res_blocks):
+                h = self.down[i_level].block[i_block](hs[-1])
+                hs.append(h)
+            if i_level != self.num_resolutions - 1:
+                hs.append(self.down[i_level].downsample(hs[-1]))
+        # middle
+        h = hs[-1]
+        h = self.mid.block_1(h)
+        h = self.mid.attn_1(h)
+        h = self.mid.block_2(h)
+        # end
+        h = self.norm_out(h)
+        h = self.swish(h)
+        h = self.conv_out(h)
+        return h
+
+
+class VAEDecoder(torch.nn.Module):
+    def __init__(
+        self,
+        ch=128,
+        out_ch=3,
+        ch_mult=(1, 2, 4, 4),
+        num_res_blocks=2,
+        resolution=256,
+        z_channels=16,
+        dtype=torch.float32,
+        device=None,
+    ):
+        super().__init__()
+        self.num_resolutions = len(ch_mult)
+        self.num_res_blocks = num_res_blocks
+        block_in = ch * ch_mult[self.num_resolutions - 1]
+        curr_res = resolution // 2 ** (self.num_resolutions - 1)
+        # z to block_in
+        self.conv_in = torch.nn.Conv2d(z_channels, block_in, kernel_size=3, stride=1, padding=1, dtype=dtype, device=device)
+        # middle
+        self.mid = torch.nn.Module()
+        self.mid.block_1 = ResnetBlock(in_channels=block_in, out_channels=block_in, dtype=dtype, device=device)
+        self.mid.attn_1 = AttnBlock(block_in, dtype=dtype, device=device)
+        self.mid.block_2 = ResnetBlock(in_channels=block_in, out_channels=block_in, dtype=dtype, device=device)
+        # upsampling
+        self.up = torch.nn.ModuleList()
+        for i_level in reversed(range(self.num_resolutions)):
+            block = torch.nn.ModuleList()
+            block_out = ch * ch_mult[i_level]
+            for i_block in range(self.num_res_blocks + 1):
+                block.append(ResnetBlock(in_channels=block_in, out_channels=block_out, dtype=dtype, device=device))
+                block_in = block_out
+            up = torch.nn.Module()
+            up.block = block
+            if i_level != 0:
+                up.upsample = Upsample(block_in, dtype=dtype, device=device)
+                curr_res = curr_res * 2
+            self.up.insert(0, up)  # prepend to get consistent order
+        # end
+        self.norm_out = Normalize(block_in, dtype=dtype, device=device)
+        self.conv_out = torch.nn.Conv2d(block_in, out_ch, kernel_size=3, stride=1, padding=1, dtype=dtype, device=device)
+        self.swish = torch.nn.SiLU(inplace=True)
+
+    def forward(self, z):
+        # z to block_in
+        hidden = self.conv_in(z)
+        # middle
+        hidden = self.mid.block_1(hidden)
+        hidden = self.mid.attn_1(hidden)
+        hidden = self.mid.block_2(hidden)
+        # upsampling
+        for i_level in reversed(range(self.num_resolutions)):
+            for i_block in range(self.num_res_blocks + 1):
+                hidden = self.up[i_level].block[i_block](hidden)
+            if i_level != 0:
+                hidden = self.up[i_level].upsample(hidden)
+        # end
+        hidden = self.norm_out(hidden)
+        hidden = self.swish(hidden)
+        hidden = self.conv_out(hidden)
+        return hidden
+
+
+class SDVAE(torch.nn.Module):
+    def __init__(self, dtype=torch.float32, device=None):
+        super().__init__()
+        self.encoder = VAEEncoder(dtype=dtype, device=device)
+        self.decoder = VAEDecoder(dtype=dtype, device=device)
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
+    @property
+    def dtype(self):
+        return next(self.parameters()).dtype
+
+    # @torch.autocast("cuda", dtype=torch.float16)
+    def decode(self, latent):
+        return self.decoder(latent)
+
+    # @torch.autocast("cuda", dtype=torch.float16)
+    def encode(self, image):
+        hidden = self.encoder(image)
+        mean, logvar = torch.chunk(hidden, 2, dim=1)
+        logvar = torch.clamp(logvar, -30.0, 20.0)
+        std = torch.exp(0.5 * logvar)
+        return mean + std * torch.randn_like(mean)
+
+    @staticmethod
+    def process_in(latent):
+        return (latent - VAE_SHIFT_FACTOR) * VAE_SCALE_FACTOR
+
+    @staticmethod
+    def process_out(latent):
+        return (latent / VAE_SCALE_FACTOR) + VAE_SHIFT_FACTOR
+
+
+# endregion
+
+
+library\sd3_train_utils.py:
+import torch
+import numpy as np
+from typing import Optional, Union, List, Tuple, Any
+
+class FlowMatchEulerDiscreteScheduler:
+    """
+    A simple scheduler for Flow Matching (Euler Discrete).
+    Used by Flux.1 and Stable Diffusion 3.
+    """
+    def __init__(
+        self,
+        num_train_timesteps: int = 1000,
+        shift: float = 1.0,
+    ):
+        self.num_train_timesteps = num_train_timesteps
+        self.shift = shift
+        self.sigmas = None
+        self.timesteps = None
+
+    def set_timesteps(self, num_inference_steps: int, device: Union[str, torch.device] = None):
+        self.timesteps = torch.linspace(1, 0, num_inference_steps + 1, device=device)[:-1]
+        self.sigmas = self.timesteps
+        if self.shift != 1.0:
+            self.timesteps = self.time_shift(self.timesteps, self.shift)
+            self.sigmas = self.timesteps
+
+    def time_shift(self, mu: float, sigma: float, t: torch.Tensor):
+        return math.exp(mu) / (math.exp(mu) + (1 / t - 1) ** sigma)
+
+    def time_shift(self, t: torch.Tensor, shift: float):
+        # Simple shift implementation for Flux
+        return (t * shift) / (1 + (shift - 1) * t)
+
+    def step(
+        self,
+        model_output: torch.Tensor,
+        timestep: Union[float, torch.Tensor],
+        sample: torch.Tensor,
+        s_churn: float = 0.0,
+        s_tmin: float = 0.0,
+        s_tmax: float = float("inf"),
+        s_noise: float = 1.0,
+        generator: Optional[torch.Generator] = None,
+        return_dict: bool = True,
+    ) -> Any:
+        # For training we mostly use noise addition logic, step is for inference/validation
+        # Minimal implementation for compatibility
+        return (sample - model_output,) # Dummy return
+
+library\sd3_utils.py:
+from dataclasses import dataclass
+import math
+import re
+from typing import Dict, List, Optional, Union
+import torch
+import safetensors
+from safetensors.torch import load_file
+from accelerate import init_empty_weights
+from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPConfig, CLIPTextConfig
+
+from .utils import setup_logging
+
+setup_logging()
+import logging
+
+logger = logging.getLogger(__name__)
+
+from library import sd3_models
+
+# TODO move some of functions to model_util.py
+from library import sdxl_model_util
+
+# region models
+
+# TODO remove dependency on flux_utils
+from library.safetensors_utils import load_safetensors
+from library.flux_utils import load_t5xxl as flux_utils_load_t5xxl
+
+
+def analyze_state_dict_state(state_dict: Dict, prefix: str = ""):
+    logger.info(f"Analyzing state dict state...")
+
+    # analyze configs
+    patch_size = state_dict[f"{prefix}x_embedder.proj.weight"].shape[2]
+    depth = state_dict[f"{prefix}x_embedder.proj.weight"].shape[0] // 64
+    num_patches = state_dict[f"{prefix}pos_embed"].shape[1]
+    pos_embed_max_size = round(math.sqrt(num_patches))
+    adm_in_channels = state_dict[f"{prefix}y_embedder.mlp.0.weight"].shape[1]
+    context_shape = state_dict[f"{prefix}context_embedder.weight"].shape
+    qk_norm = "rms" if f"{prefix}joint_blocks.0.context_block.attn.ln_k.weight" in state_dict.keys() else None
+
+    #  x_block_self_attn_layers.append(int(key.split(".x_block.attn2.ln_k.weight")[0].split(".")[-1]))
+    x_block_self_attn_layers = []
+    re_attn = re.compile(r"\.(\d+)\.x_block\.attn2\.ln_k\.weight")
+    for key in list(state_dict.keys()):
+        m = re_attn.search(key)
+        if m:
+            x_block_self_attn_layers.append(int(m.group(1)))
+
+    context_embedder_in_features = context_shape[1]
+    context_embedder_out_features = context_shape[0]
+
+    # only supports 3-5-large, medium or 3-medium. This is added after `stable-diffusion-3-`.
+    if qk_norm is not None:
+        if len(x_block_self_attn_layers) == 0:
+            model_type = "5-large"
+        else:
+            model_type = "5-medium"
+    else:
+        model_type = "medium"
+
+    params = sd3_models.SD3Params(
+        patch_size=patch_size,
+        depth=depth,
+        num_patches=num_patches,
+        pos_embed_max_size=pos_embed_max_size,
+        adm_in_channels=adm_in_channels,
+        qk_norm=qk_norm,
+        x_block_self_attn_layers=x_block_self_attn_layers,
+        context_embedder_in_features=context_embedder_in_features,
+        context_embedder_out_features=context_embedder_out_features,
+        model_type=model_type,
+    )
+    logger.info(f"Analyzed state dict state: {params}")
+    return params
+
+
+def load_mmdit(
+    state_dict: Dict, dtype: Optional[Union[str, torch.dtype]], device: Union[str, torch.device], attn_mode: str = "torch"
+) -> sd3_models.MMDiT:
+    mmdit_sd = {}
+
+    mmdit_prefix = "model.diffusion_model."
+    for k in list(state_dict.keys()):
+        if k.startswith(mmdit_prefix):
+            mmdit_sd[k[len(mmdit_prefix) :]] = state_dict.pop(k)
+
+    # load MMDiT
+    logger.info("Building MMDit")
+    params = analyze_state_dict_state(mmdit_sd)
+    with init_empty_weights():
+        mmdit = sd3_models.create_sd3_mmdit(params, attn_mode)
+
+    logger.info("Loading state dict...")
+    info = mmdit.load_state_dict(mmdit_sd, strict=False, assign=True)
+    logger.info(f"Loaded MMDiT: {info}")
+    return mmdit
+
+
+def load_clip_l(
+    clip_l_path: Optional[str],
+    dtype: Optional[Union[str, torch.dtype]],
+    device: Union[str, torch.device],
+    disable_mmap: bool = False,
+    state_dict: Optional[Dict] = None,
+):
+    clip_l_sd = None
+    if clip_l_path is None:
+        if "text_encoders.clip_l.transformer.text_model.embeddings.position_embedding.weight" in state_dict:
+            # found clip_l: remove prefix "text_encoders.clip_l."
+            logger.info("clip_l is included in the checkpoint")
+            clip_l_sd = {}
+            prefix = "text_encoders.clip_l."
+            for k in list(state_dict.keys()):
+                if k.startswith(prefix):
+                    clip_l_sd[k[len(prefix) :]] = state_dict.pop(k)
+        elif clip_l_path is None:
+            logger.info("clip_l is not included in the checkpoint and clip_l_path is not provided")
+            return None
+
+    # load clip_l
+    logger.info("Building CLIP-L")
+    config = CLIPTextConfig(
+        vocab_size=49408,
+        hidden_size=768,
+        intermediate_size=3072,
+        num_hidden_layers=12,
+        num_attention_heads=12,
+        max_position_embeddings=77,
+        hidden_act="quick_gelu",
+        layer_norm_eps=1e-05,
+        dropout=0.0,
+        attention_dropout=0.0,
+        initializer_range=0.02,
+        initializer_factor=1.0,
+        pad_token_id=1,
+        bos_token_id=0,
+        eos_token_id=2,
+        model_type="clip_text_model",
+        projection_dim=768,
+        # torch_dtype="float32",
+        # transformers_version="4.25.0.dev0",
+    )
+    with init_empty_weights():
+        clip = CLIPTextModelWithProjection(config)
+
+    if clip_l_sd is None:
+        logger.info(f"Loading state dict from {clip_l_path}")
+        clip_l_sd = load_safetensors(clip_l_path, device=str(device), disable_mmap=disable_mmap, dtype=dtype)
+
+    if "text_projection.weight" not in clip_l_sd:
+        logger.info("Adding text_projection.weight to clip_l_sd")
+        clip_l_sd["text_projection.weight"] = torch.eye(768, dtype=dtype, device=device)
+
+    info = clip.load_state_dict(clip_l_sd, strict=False, assign=True)
+    logger.info(f"Loaded CLIP-L: {info}")
+    return clip
+
+
+def load_clip_g(
+    clip_g_path: Optional[str],
+    dtype: Optional[Union[str, torch.dtype]],
+    device: Union[str, torch.device],
+    disable_mmap: bool = False,
+    state_dict: Optional[Dict] = None,
+):
+    clip_g_sd = None
+    if state_dict is not None:
+        if "text_encoders.clip_g.transformer.text_model.embeddings.position_embedding.weight" in state_dict:
+            # found clip_g: remove prefix "text_encoders.clip_g."
+            logger.info("clip_g is included in the checkpoint")
+            clip_g_sd = {}
+            prefix = "text_encoders.clip_g."
+            for k in list(state_dict.keys()):
+                if k.startswith(prefix):
+                    clip_g_sd[k[len(prefix) :]] = state_dict.pop(k)
+        elif clip_g_path is None:
+            logger.info("clip_g is not included in the checkpoint and clip_g_path is not provided")
+            return None
+
+    # load clip_g
+    logger.info("Building CLIP-G")
+    config = CLIPTextConfig(
+        vocab_size=49408,
+        hidden_size=1280,
+        intermediate_size=5120,
+        num_hidden_layers=32,
+        num_attention_heads=20,
+        max_position_embeddings=77,
+        hidden_act="gelu",
+        layer_norm_eps=1e-05,
+        dropout=0.0,
+        attention_dropout=0.0,
+        initializer_range=0.02,
+        initializer_factor=1.0,
+        pad_token_id=1,
+        bos_token_id=0,
+        eos_token_id=2,
+        model_type="clip_text_model",
+        projection_dim=1280,
+        # torch_dtype="float32",
+        # transformers_version="4.25.0.dev0",
+    )
+    with init_empty_weights():
+        clip = CLIPTextModelWithProjection(config)
+
+    if clip_g_sd is None:
+        logger.info(f"Loading state dict from {clip_g_path}")
+        clip_g_sd = load_safetensors(clip_g_path, device=str(device), disable_mmap=disable_mmap, dtype=dtype)
+    info = clip.load_state_dict(clip_g_sd, strict=False, assign=True)
+    logger.info(f"Loaded CLIP-G: {info}")
+    return clip
+
+
+def load_t5xxl(
+    t5xxl_path: Optional[str],
+    dtype: Optional[Union[str, torch.dtype]],
+    device: Union[str, torch.device],
+    disable_mmap: bool = False,
+    state_dict: Optional[Dict] = None,
+):
+    t5xxl_sd = None
+    if state_dict is not None:
+        if "text_encoders.t5xxl.transformer.encoder.block.0.layer.0.SelfAttention.k.weight" in state_dict:
+            # found t5xxl: remove prefix "text_encoders.t5xxl."
+            logger.info("t5xxl is included in the checkpoint")
+            t5xxl_sd = {}
+            prefix = "text_encoders.t5xxl."
+            for k in list(state_dict.keys()):
+                if k.startswith(prefix):
+                    t5xxl_sd[k[len(prefix) :]] = state_dict.pop(k)
+        elif t5xxl_path is None:
+            logger.info("t5xxl is not included in the checkpoint and t5xxl_path is not provided")
+            return None
+
+    return flux_utils_load_t5xxl(t5xxl_path, dtype, device, disable_mmap, state_dict=t5xxl_sd)
+
+
+def load_vae(
+    vae_path: Optional[str],
+    vae_dtype: Optional[Union[str, torch.dtype]],
+    device: Optional[Union[str, torch.device]],
+    disable_mmap: bool = False,
+    state_dict: Optional[Dict] = None,
+):
+    vae_sd = {}
+    if vae_path:
+        logger.info(f"Loading VAE from {vae_path}...")
+        vae_sd = load_safetensors(vae_path, device, disable_mmap, dtype=vae_dtype)
+    else:
+        # remove prefix "first_stage_model."
+        vae_sd = {}
+        vae_prefix = "first_stage_model."
+        for k in list(state_dict.keys()):
+            if k.startswith(vae_prefix):
+                vae_sd[k[len(vae_prefix) :]] = state_dict.pop(k)
+
+    logger.info("Building VAE")
+    vae = sd3_models.SDVAE(vae_dtype, device)
+    logger.info("Loading state dict...")
+    info = vae.load_state_dict(vae_sd)
+    logger.info(f"Loaded VAE: {info}")
+    vae.to(device=device, dtype=vae_dtype)  # make sure it's in the right device and dtype
+    return vae
+
+
+# endregion
+
+
+class ModelSamplingDiscreteFlow:
+    """Helper for sampler scheduling (ie timestep/sigma calculations) for Discrete Flow models"""
+
+    def __init__(self, shift=1.0):
+        self.shift = shift
+        timesteps = 1000
+        self.sigmas = self.sigma(torch.arange(1, timesteps + 1, 1))
+
+    @property
+    def sigma_min(self):
+        return self.sigmas[0]
+
+    @property
+    def sigma_max(self):
+        return self.sigmas[-1]
+
+    def timestep(self, sigma):
+        return sigma * 1000
+
+    def sigma(self, timestep: torch.Tensor):
+        timestep = timestep / 1000.0
+        if self.shift == 1.0:
+            return timestep
+        return self.shift * timestep / (1 + (self.shift - 1) * timestep)
+
+    def calculate_denoised(self, sigma, model_output, model_input):
+        sigma = sigma.view(sigma.shape[:1] + (1,) * (model_output.ndim - 1))
+        return model_input - model_output * sigma
+
+    def noise_scaling(self, sigma, noise, latent_image, max_denoise=False):
+        # assert max_denoise is False, "max_denoise not implemented"
+        # max_denoise is always True, I'm not sure why it's there
+        return sigma * noise + (1.0 - sigma) * latent_image
+
+
+library\sdxl_lpw_stable_diffusion.py:
+# copy from https://github.com/huggingface/diffusers/blob/main/examples/community/lpw_stable_diffusion.py
+# and modify to support SD2.x
+
+import inspect
+import re
+from typing import Callable, List, Optional, Union
+
+import numpy as np
+import PIL.Image
+import torch
+from packaging import version
+from tqdm import tqdm
+from transformers import CLIPFeatureExtractor, CLIPTextModel, CLIPTokenizer
+
+from diffusers import SchedulerMixin, StableDiffusionPipeline
+from diffusers.models import AutoencoderKL
+from diffusers.pipelines.stable_diffusion import StableDiffusionSafetyChecker
+from diffusers.utils import logging
+from PIL import Image
+
+from library import (
+    sdxl_model_util,
+    sdxl_train_util,
+    strategy_base,
+    strategy_sdxl,
+    train_util,
+    sdxl_original_unet,
+    sdxl_original_control_net,
+)
+
+
+try:
+    from diffusers.utils import PIL_INTERPOLATION
+except ImportError:
+    if version.parse(version.parse(PIL.__version__).base_version) >= version.parse("9.1.0"):
+        PIL_INTERPOLATION = {
+            "linear": PIL.Image.Resampling.BILINEAR,
+            "bilinear": PIL.Image.Resampling.BILINEAR,
+            "bicubic": PIL.Image.Resampling.BICUBIC,
+            "lanczos": PIL.Image.Resampling.LANCZOS,
+            "nearest": PIL.Image.Resampling.NEAREST,
+        }
+    else:
+        PIL_INTERPOLATION = {
+            "linear": PIL.Image.LINEAR,
+            "bilinear": PIL.Image.BILINEAR,
+            "bicubic": PIL.Image.BICUBIC,
+            "lanczos": PIL.Image.LANCZOS,
+            "nearest": PIL.Image.NEAREST,
+        }
+# ------------------------------------------------------------------------------
+
+logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+
+re_attention = re.compile(
+    r"""
+\\\(|
+\\\)|
+\\\[|
+\\]|
+\\\\|
+\\|
+\(|
+\[|
+:([+-]?[.\d]+)\)|
+\)|
+]|
+[^\\()\[\]:]+|
+:
+""",
+    re.X,
+)
+
+
+def parse_prompt_attention(text):
+    """
+    Parses a string with attention tokens and returns a list of pairs: text and its associated weight.
+    Accepted tokens are:
+      (abc) - increases attention to abc by a multiplier of 1.1
+      (abc:3.12) - increases attention to abc by a multiplier of 3.12
+      [abc] - decreases attention to abc by a multiplier of 1.1
+      \( - literal character '('
+      \[ - literal character '['
+      \) - literal character ')'
+      \] - literal character ']'
+      \\ - literal character '\'
+      anything else - just text
+    >>> parse_prompt_attention('normal text')
+    [['normal text', 1.0]]
+    >>> parse_prompt_attention('an (important) word')
+    [['an ', 1.0], ['important', 1.1], [' word', 1.0]]
+    >>> parse_prompt_attention('(unbalanced')
+    [['unbalanced', 1.1]]
+    >>> parse_prompt_attention('\(literal\]')
+    [['(literal]', 1.0]]
+    >>> parse_prompt_attention('(unnecessary)(parens)')
+    [['unnecessaryparens', 1.1]]
+    >>> parse_prompt_attention('a (((house:1.3)) [on] a (hill:0.5), sun, (((sky))).')
+    [['a ', 1.0],
+     ['house', 1.5730000000000004],
+     [' ', 1.1],
+     ['on', 1.0],
+     [' a ', 1.1],
+     ['hill', 0.55],
+     [', sun, ', 1.1],
+     ['sky', 1.4641000000000006],
+     ['.', 1.1]]
+    """
+
+    res = []
+    round_brackets = []
+    square_brackets = []
+
+    round_bracket_multiplier = 1.1
+    square_bracket_multiplier = 1 / 1.1
+
+    def multiply_range(start_position, multiplier):
+        for p in range(start_position, len(res)):
+            res[p][1] *= multiplier
+
+    for m in re_attention.finditer(text):
+        text = m.group(0)
+        weight = m.group(1)
+
+        if text.startswith("\\"):
+            res.append([text[1:], 1.0])
+        elif text == "(":
+            round_brackets.append(len(res))
+        elif text == "[":
+            square_brackets.append(len(res))
+        elif weight is not None and len(round_brackets) > 0:
+            multiply_range(round_brackets.pop(), float(weight))
+        elif text == ")" and len(round_brackets) > 0:
+            multiply_range(round_brackets.pop(), round_bracket_multiplier)
+        elif text == "]" and len(square_brackets) > 0:
+            multiply_range(square_brackets.pop(), square_bracket_multiplier)
+        else:
+            res.append([text, 1.0])
+
+    for pos in round_brackets:
+        multiply_range(pos, round_bracket_multiplier)
+
+    for pos in square_brackets:
+        multiply_range(pos, square_bracket_multiplier)
+
+    if len(res) == 0:
+        res = [["", 1.0]]
+
+    # merge runs of identical weights
+    i = 0
+    while i + 1 < len(res):
+        if res[i][1] == res[i + 1][1]:
+            res[i][0] += res[i + 1][0]
+            res.pop(i + 1)
+        else:
+            i += 1
+
+    return res
+
+
+def get_prompts_with_weights(pipe: StableDiffusionPipeline, prompt: List[str], max_length: int):
+    r"""
+    Tokenize a list of prompts and return its tokens with weights of each token.
+
+    No padding, starting or ending token is included.
+    """
+    tokens = []
+    weights = []
+    truncated = False
+    for text in prompt:
+        texts_and_weights = parse_prompt_attention(text)
+        text_token = []
+        text_weight = []
+        for word, weight in texts_and_weights:
+            # tokenize and discard the starting and the ending token
+            token = pipe.tokenizer(word).input_ids[1:-1]
+            text_token += token
+            # copy the weight by length of token
+            text_weight += [weight] * len(token)
+            # stop if the text is too long (longer than truncation limit)
+            if len(text_token) > max_length:
+                truncated = True
+                break
+        # truncate
+        if len(text_token) > max_length:
+            truncated = True
+            text_token = text_token[:max_length]
+            text_weight = text_weight[:max_length]
+        tokens.append(text_token)
+        weights.append(text_weight)
+    if truncated:
+        logger.warning("Prompt was truncated. Try to shorten the prompt or increase max_embeddings_multiples")
+    return tokens, weights
+
+
+def pad_tokens_and_weights(tokens, weights, max_length, bos, eos, pad, no_boseos_middle=True, chunk_length=77):
+    r"""
+    Pad the tokens (with starting and ending tokens) and weights (with 1.0) to max_length.
+    """
+    max_embeddings_multiples = (max_length - 2) // (chunk_length - 2)
+    weights_length = max_length if no_boseos_middle else max_embeddings_multiples * chunk_length
+    for i in range(len(tokens)):
+        tokens[i] = [bos] + tokens[i] + [eos] + [pad] * (max_length - 2 - len(tokens[i]))
+        if no_boseos_middle:
+            weights[i] = [1.0] + weights[i] + [1.0] * (max_length - 1 - len(weights[i]))
+        else:
+            w = []
+            if len(weights[i]) == 0:
+                w = [1.0] * weights_length
+            else:
+                for j in range(max_embeddings_multiples):
+                    w.append(1.0)  # weight for starting token in this chunk
+                    w += weights[i][j * (chunk_length - 2) : min(len(weights[i]), (j + 1) * (chunk_length - 2))]
+                    w.append(1.0)  # weight for ending token in this chunk
+                w += [1.0] * (weights_length - len(w))
+            weights[i] = w[:]
+
+    return tokens, weights
+
+
+def get_hidden_states(text_encoder, input_ids, is_sdxl_text_encoder2: bool, eos_token_id, device):
+    if not is_sdxl_text_encoder2:
+        # text_encoder1: same as SD1/2
+        enc_out = text_encoder(input_ids.to(text_encoder.device), output_hidden_states=True, return_dict=True)
+        hidden_states = enc_out["hidden_states"][11]
+        pool = None
+    else:
+        # text_encoder2
+        enc_out = text_encoder(input_ids.to(text_encoder.device), output_hidden_states=True, return_dict=True)
+        hidden_states = enc_out["hidden_states"][-2]  # penuultimate layer
+        # pool = enc_out["text_embeds"]
+        pool = train_util.pool_workaround(text_encoder, enc_out["last_hidden_state"], input_ids, eos_token_id)
+    hidden_states = hidden_states.to(device)
+    if pool is not None:
+        pool = pool.to(device)
+    return hidden_states, pool
+
+
+def get_unweighted_text_embeddings(
+    pipe: StableDiffusionPipeline,
+    text_input: torch.Tensor,
+    chunk_length: int,
+    clip_skip: int,
+    eos: int,
+    pad: int,
+    is_sdxl_text_encoder2: bool,
+    no_boseos_middle: Optional[bool] = True,
+):
+    """
+    When the length of tokens is a multiple of the capacity of the text encoder,
+    it should be split into chunks and sent to the text encoder individually.
+    """
+    max_embeddings_multiples = (text_input.shape[1] - 2) // (chunk_length - 2)
+    text_pool = None
+    if max_embeddings_multiples > 1:
+        text_embeddings = []
+        for i in range(max_embeddings_multiples):
+            # extract the i-th chunk
+            text_input_chunk = text_input[:, i * (chunk_length - 2) : (i + 1) * (chunk_length - 2) + 2].clone()
+
+            # cover the head and the tail by the starting and the ending tokens
+            text_input_chunk[:, 0] = text_input[0, 0]
+            if pad == eos:  # v1
+                text_input_chunk[:, -1] = text_input[0, -1]
+            else:  # v2
+                for j in range(len(text_input_chunk)):
+                    if text_input_chunk[j, -1] != eos and text_input_chunk[j, -1] != pad:  # 最後に普通の文字がある
+                        text_input_chunk[j, -1] = eos
+                    if text_input_chunk[j, 1] == pad:  # BOSだけであとはPAD
+                        text_input_chunk[j, 1] = eos
+
+            text_embedding, current_text_pool = get_hidden_states(
+                pipe.text_encoder, text_input_chunk, is_sdxl_text_encoder2, eos, pipe.device
+            )
+            if text_pool is None:
+                text_pool = current_text_pool
+
+            if no_boseos_middle:
+                if i == 0:
+                    # discard the ending token
+                    text_embedding = text_embedding[:, :-1]
+                elif i == max_embeddings_multiples - 1:
+                    # discard the starting token
+                    text_embedding = text_embedding[:, 1:]
+                else:
+                    # discard both starting and ending tokens
+                    text_embedding = text_embedding[:, 1:-1]
+
+            text_embeddings.append(text_embedding)
+        text_embeddings = torch.concat(text_embeddings, axis=1)
+    else:
+        text_embeddings, text_pool = get_hidden_states(pipe.text_encoder, text_input, is_sdxl_text_encoder2, eos, pipe.device)
+    return text_embeddings, text_pool
+
+
+def get_weighted_text_embeddings(
+    pipe,  # : SdxlStableDiffusionLongPromptWeightingPipeline,
+    prompt: Union[str, List[str]],
+    uncond_prompt: Optional[Union[str, List[str]]] = None,
+    max_embeddings_multiples: Optional[int] = 3,
+    no_boseos_middle: Optional[bool] = False,
+    skip_parsing: Optional[bool] = False,
+    skip_weighting: Optional[bool] = False,
+    clip_skip=None,
+    is_sdxl_text_encoder2=False,
+):
+    r"""
+    Prompts can be assigned with local weights using brackets. For example,
+    prompt 'A (very beautiful) masterpiece' highlights the words 'very beautiful',
+    and the embedding tokens corresponding to the words get multiplied by a constant, 1.1.
+
+    Also, to regularize of the embedding, the weighted embedding would be scaled to preserve the original mean.
+
+    Args:
+        pipe (`StableDiffusionPipeline`):
+            Pipe to provide access to the tokenizer and the text encoder.
+        prompt (`str` or `List[str]`):
+            The prompt or prompts to guide the image generation.
+        uncond_prompt (`str` or `List[str]`):
+            The unconditional prompt or prompts for guide the image generation. If unconditional prompt
+            is provided, the embeddings of prompt and uncond_prompt are concatenated.
+        max_embeddings_multiples (`int`, *optional*, defaults to `3`):
+            The max multiple length of prompt embeddings compared to the max output length of text encoder.
+        no_boseos_middle (`bool`, *optional*, defaults to `False`):
+            If the length of text token is multiples of the capacity of text encoder, whether reserve the starting and
+            ending token in each of the chunk in the middle.
+        skip_parsing (`bool`, *optional*, defaults to `False`):
+            Skip the parsing of brackets.
+        skip_weighting (`bool`, *optional*, defaults to `False`):
+            Skip the weighting. When the parsing is skipped, it is forced True.
+    """
+    max_length = (pipe.tokenizer.model_max_length - 2) * max_embeddings_multiples + 2
+    if isinstance(prompt, str):
+        prompt = [prompt]
+
+    if not skip_parsing:
+        prompt_tokens, prompt_weights = get_prompts_with_weights(pipe, prompt, max_length - 2)
+        if uncond_prompt is not None:
+            if isinstance(uncond_prompt, str):
+                uncond_prompt = [uncond_prompt]
+            uncond_tokens, uncond_weights = get_prompts_with_weights(pipe, uncond_prompt, max_length - 2)
+    else:
+        prompt_tokens = [token[1:-1] for token in pipe.tokenizer(prompt, max_length=max_length, truncation=True).input_ids]
+        prompt_weights = [[1.0] * len(token) for token in prompt_tokens]
+        if uncond_prompt is not None:
+            if isinstance(uncond_prompt, str):
+                uncond_prompt = [uncond_prompt]
+            uncond_tokens = [
+                token[1:-1] for token in pipe.tokenizer(uncond_prompt, max_length=max_length, truncation=True).input_ids
+            ]
+            uncond_weights = [[1.0] * len(token) for token in uncond_tokens]
+
+    # round up the longest length of tokens to a multiple of (model_max_length - 2)
+    max_length = max([len(token) for token in prompt_tokens])
+    if uncond_prompt is not None:
+        max_length = max(max_length, max([len(token) for token in uncond_tokens]))
+
+    max_embeddings_multiples = min(
+        max_embeddings_multiples,
+        (max_length - 1) // (pipe.tokenizer.model_max_length - 2) + 1,
+    )
+    max_embeddings_multiples = max(1, max_embeddings_multiples)
+    max_length = (pipe.tokenizer.model_max_length - 2) * max_embeddings_multiples + 2
+
+    # pad the length of tokens and weights
+    bos = pipe.tokenizer.bos_token_id
+    eos = pipe.tokenizer.eos_token_id
+    pad = pipe.tokenizer.pad_token_id
+    prompt_tokens, prompt_weights = pad_tokens_and_weights(
+        prompt_tokens,
+        prompt_weights,
+        max_length,
+        bos,
+        eos,
+        pad,
+        no_boseos_middle=no_boseos_middle,
+        chunk_length=pipe.tokenizer.model_max_length,
+    )
+    prompt_tokens = torch.tensor(prompt_tokens, dtype=torch.long, device=pipe.device)
+    if uncond_prompt is not None:
+        uncond_tokens, uncond_weights = pad_tokens_and_weights(
+            uncond_tokens,
+            uncond_weights,
+            max_length,
+            bos,
+            eos,
+            pad,
+            no_boseos_middle=no_boseos_middle,
+            chunk_length=pipe.tokenizer.model_max_length,
+        )
+        uncond_tokens = torch.tensor(uncond_tokens, dtype=torch.long, device=pipe.device)
+
+    # get the embeddings
+    text_embeddings, text_pool = get_unweighted_text_embeddings(
+        pipe,
+        prompt_tokens,
+        pipe.tokenizer.model_max_length,
+        clip_skip,
+        eos,
+        pad,
+        is_sdxl_text_encoder2,
+        no_boseos_middle=no_boseos_middle,
+    )
+    prompt_weights = torch.tensor(prompt_weights, dtype=text_embeddings.dtype, device=pipe.device)
+
+    if uncond_prompt is not None:
+        uncond_embeddings, uncond_pool = get_unweighted_text_embeddings(
+            pipe,
+            uncond_tokens,
+            pipe.tokenizer.model_max_length,
+            clip_skip,
+            eos,
+            pad,
+            is_sdxl_text_encoder2,
+            no_boseos_middle=no_boseos_middle,
+        )
+        uncond_weights = torch.tensor(uncond_weights, dtype=uncond_embeddings.dtype, device=pipe.device)
+
+    # assign weights to the prompts and normalize in the sense of mean
+    # TODO: should we normalize by chunk or in a whole (current implementation)?
+    if (not skip_parsing) and (not skip_weighting):
+        previous_mean = text_embeddings.float().mean(axis=[-2, -1]).to(text_embeddings.dtype)
+        text_embeddings *= prompt_weights.unsqueeze(-1)
+        current_mean = text_embeddings.float().mean(axis=[-2, -1]).to(text_embeddings.dtype)
+        text_embeddings *= (previous_mean / current_mean).unsqueeze(-1).unsqueeze(-1)
+        if uncond_prompt is not None:
+            previous_mean = uncond_embeddings.float().mean(axis=[-2, -1]).to(uncond_embeddings.dtype)
+            uncond_embeddings *= uncond_weights.unsqueeze(-1)
+            current_mean = uncond_embeddings.float().mean(axis=[-2, -1]).to(uncond_embeddings.dtype)
+            uncond_embeddings *= (previous_mean / current_mean).unsqueeze(-1).unsqueeze(-1)
+
+    if uncond_prompt is not None:
+        return text_embeddings, text_pool, uncond_embeddings, uncond_pool
+    return text_embeddings, text_pool, None, None
+
+
+def preprocess_image(image):
+    w, h = image.size
+    w, h = map(lambda x: x - x % 32, (w, h))  # resize to integer multiple of 32
+    image = image.resize((w, h), resample=PIL_INTERPOLATION["lanczos"])
+    image = np.array(image).astype(np.float32) / 255.0
+    image = image[None].transpose(0, 3, 1, 2)
+    image = torch.from_numpy(image)
+    return 2.0 * image - 1.0
+
+
+def preprocess_mask(mask, scale_factor=8):
+    mask = mask.convert("L")
+    w, h = mask.size
+    w, h = map(lambda x: x - x % 32, (w, h))  # resize to integer multiple of 32
+    mask = mask.resize((w // scale_factor, h // scale_factor), resample=PIL_INTERPOLATION["nearest"])
+    mask = np.array(mask).astype(np.float32) / 255.0
+    mask = np.tile(mask, (4, 1, 1))
+    mask = mask[None].transpose(0, 1, 2, 3)  # what does this step do?
+    mask = 1 - mask  # repaint white, keep black
+    mask = torch.from_numpy(mask)
+    return mask
+
+
+def prepare_controlnet_image(
+    image: PIL.Image.Image,
+    width: int,
+    height: int,
+    batch_size: int,
+    num_images_per_prompt: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    do_classifier_free_guidance: bool = False,
+    guess_mode: bool = False,
+):
+    if not isinstance(image, torch.Tensor):
+        if isinstance(image, PIL.Image.Image):
+            image = [image]
+
+        if isinstance(image[0], PIL.Image.Image):
+            images = []
+
+            for image_ in image:
+                image_ = image_.convert("RGB")
+                image_ = image_.resize((width, height), resample=PIL_INTERPOLATION["lanczos"])
+                image_ = np.array(image_)
+                image_ = image_[None, :]
+                images.append(image_)
+
+            image = images
+
+            image = np.concatenate(image, axis=0)
+            image = np.array(image).astype(np.float32) / 255.0
+            image = image.transpose(0, 3, 1, 2)
+            image = torch.from_numpy(image)
+        elif isinstance(image[0], torch.Tensor):
+            image = torch.cat(image, dim=0)
+
+    image_batch_size = image.shape[0]
+
+    if image_batch_size == 1:
+        repeat_by = batch_size
+    else:
+        # image batch size is the same as prompt batch size
+        repeat_by = num_images_per_prompt
+
+    image = image.repeat_interleave(repeat_by, dim=0)
+
+    image = image.to(device=device, dtype=dtype)
+
+    if do_classifier_free_guidance and not guess_mode:
+        image = torch.cat([image] * 2)
+
+    return image
+
+
+class SdxlStableDiffusionLongPromptWeightingPipeline:
+    r"""
+    Pipeline for text-to-image generation using Stable Diffusion without tokens length limit, and support parsing
+    weighting in prompt.
+
+    This model inherits from [`DiffusionPipeline`]. Check the superclass documentation for the generic methods the
+    library implements for all the pipelines (such as downloading or saving, running on a particular device, etc.)
+
+    Args:
+        vae ([`AutoencoderKL`]):
+            Variational Auto-Encoder (VAE) Model to encode and decode images to and from latent representations.
+        text_encoder ([`CLIPTextModel`]):
+            Frozen text-encoder. Stable Diffusion uses the text portion of
+            [CLIP](https://huggingface.co/docs/transformers/model_doc/clip#transformers.CLIPTextModel), specifically
+            the [clip-vit-large-patch14](https://huggingface.co/openai/clip-vit-large-patch14) variant.
+        tokenizer (`CLIPTokenizer`):
+            Tokenizer of class
+            [CLIPTokenizer](https://huggingface.co/docs/transformers/v4.21.0/en/model_doc/clip#transformers.CLIPTokenizer).
+        unet ([`UNet2DConditionModel`]): Conditional U-Net architecture to denoise the encoded image latents.
+        scheduler ([`SchedulerMixin`]):
+            A scheduler to be used in combination with `unet` to denoise the encoded image latents. Can be one of
+            [`DDIMScheduler`], [`LMSDiscreteScheduler`], or [`PNDMScheduler`].
+        safety_checker ([`StableDiffusionSafetyChecker`]):
+            Classification module that estimates whether generated images could be considered offensive or harmful.
+            Please, refer to the [model card](https://huggingface.co/CompVis/stable-diffusion-v1-4) for details.
+        feature_extractor ([`CLIPFeatureExtractor`]):
+            Model that extracts features from generated images to be used as inputs for the `safety_checker`.
+    """
+
+    # if version.parse(version.parse(diffusers.__version__).base_version) >= version.parse("0.9.0"):
+
+    def __init__(
+        self,
+        vae: AutoencoderKL,
+        text_encoder: List[CLIPTextModel],
+        tokenizer: List[CLIPTokenizer],
+        unet: Union[sdxl_original_unet.SdxlUNet2DConditionModel, sdxl_original_control_net.SdxlControlledUNet],
+        scheduler: SchedulerMixin,
+        # clip_skip: int,
+        safety_checker: StableDiffusionSafetyChecker,
+        feature_extractor: CLIPFeatureExtractor,
+        requires_safety_checker: bool = True,
+        clip_skip: int = 1,
+    ):
+        # clip skip is ignored currently
+        self.tokenizer = tokenizer[0]
+        self.text_encoder = text_encoder[0]
+        self.unet = unet
+        self.scheduler = scheduler
+        self.safety_checker = safety_checker
+        self.feature_extractor = feature_extractor
+        self.requires_safety_checker = requires_safety_checker
+        self.vae = vae
+        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
+        self.progress_bar = lambda x: tqdm(x, leave=False)
+
+        self.clip_skip = clip_skip
+        self.tokenizers = tokenizer
+        self.text_encoders = text_encoder
+
+    #     self.__init__additional__()
+
+    # def __init__additional__(self):
+    #     if not hasattr(self, "vae_scale_factor"):
+    #         setattr(self, "vae_scale_factor", 2 ** (len(self.vae.config.block_out_channels) - 1))
+
+    def to(self, device=None, dtype=None):
+        if device is not None:
+            self.device = device
+            # self.vae.to(device=self.device)
+        if dtype is not None:
+            self.dtype = dtype
+
+        # do not move Text Encoders to device, because Text Encoder should be on CPU
+
+    @property
+    def _execution_device(self):
+        r"""
+        Returns the device on which the pipeline's models will be executed. After calling
+        `pipeline.enable_sequential_cpu_offload()` the execution device can only be inferred from Accelerate's module
+        hooks.
+        """
+        if self.device != torch.device("meta") or not hasattr(self.unet, "_hf_hook"):
+            return self.device
+        for module in self.unet.modules():
+            if (
+                hasattr(module, "_hf_hook")
+                and hasattr(module._hf_hook, "execution_device")
+                and module._hf_hook.execution_device is not None
+            ):
+                return torch.device(module._hf_hook.execution_device)
+        return self.device
+
+    def check_inputs(self, prompt, height, width, strength, callback_steps):
+        if not isinstance(prompt, str) and not isinstance(prompt, list):
+            raise ValueError(f"`prompt` has to be of type `str` or `list` but is {type(prompt)}")
+
+        if strength < 0 or strength > 1:
+            raise ValueError(f"The value of strength should in [0.0, 1.0] but is {strength}")
+
+        if height % 8 != 0 or width % 8 != 0:
+            raise ValueError(f"`height` and `width` have to be divisible by 8 but are {height} and {width}.")
+
+        if (callback_steps is None) or (
+            callback_steps is not None and (not isinstance(callback_steps, int) or callback_steps <= 0)
+        ):
+            raise ValueError(
+                f"`callback_steps` has to be a positive integer but is {callback_steps} of type" f" {type(callback_steps)}."
+            )
+
+    def get_timesteps(self, num_inference_steps, strength, device, is_text2img):
+        if is_text2img:
+            return self.scheduler.timesteps.to(device), num_inference_steps
+        else:
+            # get the original timestep using init_timestep
+            offset = self.scheduler.config.get("steps_offset", 0)
+            init_timestep = int(num_inference_steps * strength) + offset
+            init_timestep = min(init_timestep, num_inference_steps)
+
+            t_start = max(num_inference_steps - init_timestep + offset, 0)
+            timesteps = self.scheduler.timesteps[t_start:].to(device)
+            return timesteps, num_inference_steps - t_start
+
+    def run_safety_checker(self, image, device, dtype):
+        if self.safety_checker is not None:
+            safety_checker_input = self.feature_extractor(self.numpy_to_pil(image), return_tensors="pt").to(device)
+            image, has_nsfw_concept = self.safety_checker(images=image, clip_input=safety_checker_input.pixel_values.to(dtype))
+        else:
+            has_nsfw_concept = None
+        return image, has_nsfw_concept
+
+    def decode_latents(self, latents):
+        with torch.no_grad():
+            latents = 1 / sdxl_model_util.VAE_SCALE_FACTOR * latents
+
+            # print("post_quant_conv dtype:", self.vae.post_quant_conv.weight.dtype)  # torch.float32
+            # x = torch.nn.functional.conv2d(latents, self.vae.post_quant_conv.weight.detach(), stride=1, padding=0)
+            # print("latents dtype:", latents.dtype, "x dtype:", x.dtype)  # torch.float32, torch.float16
+            # self.vae.to("cpu")
+            # self.vae.set_use_memory_efficient_attention_xformers(False)
+            # image = self.vae.decode(latents.to("cpu")).sample
+
+            image = self.vae.decode(latents.to(self.vae.dtype)).sample
+            image = (image / 2 + 0.5).clamp(0, 1)
+            # we always cast to float32 as this does not cause significant overhead and is compatible with bfloat16
+            image = image.cpu().permute(0, 2, 3, 1).float().numpy()
+            return image
+
+    def prepare_extra_step_kwargs(self, generator, eta):
+        # prepare extra kwargs for the scheduler step, since not all schedulers have the same signature
+        # eta (η) is only used with the DDIMScheduler, it will be ignored for other schedulers.
+        # eta corresponds to η in DDIM paper: https://arxiv.org/abs/2010.02502
+        # and should be between [0, 1]
+
+        accepts_eta = "eta" in set(inspect.signature(self.scheduler.step).parameters.keys())
+        extra_step_kwargs = {}
+        if accepts_eta:
+            extra_step_kwargs["eta"] = eta
+
+        # check if the scheduler accepts generator
+        accepts_generator = "generator" in set(inspect.signature(self.scheduler.step).parameters.keys())
+        if accepts_generator:
+            extra_step_kwargs["generator"] = generator
+        return extra_step_kwargs
+
+    def prepare_latents(self, image, timestep, batch_size, height, width, dtype, device, generator, latents=None):
+        if image is None:
+            shape = (
+                batch_size,
+                self.unet.in_channels,
+                height // self.vae_scale_factor,
+                width // self.vae_scale_factor,
+            )
+
+            if latents is None:
+                if device.type == "mps":
+                    # randn does not work reproducibly on mps
+                    latents = torch.randn(shape, generator=generator, device="cpu", dtype=dtype).to(device)
+                else:
+                    latents = torch.randn(shape, generator=generator, device=device, dtype=dtype)
+            else:
+                if latents.shape != shape:
+                    raise ValueError(f"Unexpected latents shape, got {latents.shape}, expected {shape}")
+                latents = latents.to(device)
+
+            # scale the initial noise by the standard deviation required by the scheduler
+            latents = latents * self.scheduler.init_noise_sigma
+            return latents, None, None
+        else:
+            init_latent_dist = self.vae.encode(image).latent_dist
+            init_latents = init_latent_dist.sample(generator=generator)
+            init_latents = sdxl_model_util.VAE_SCALE_FACTOR * init_latents
+            init_latents = torch.cat([init_latents] * batch_size, dim=0)
+            init_latents_orig = init_latents
+            shape = init_latents.shape
+
+            # add noise to latents using the timesteps
+            if device.type == "mps":
+                noise = torch.randn(shape, generator=generator, device="cpu", dtype=dtype).to(device)
+            else:
+                noise = torch.randn(shape, generator=generator, device=device, dtype=dtype)
+            latents = self.scheduler.add_noise(init_latents, noise, timestep)
+            return latents, init_latents_orig, noise
+
+    @torch.no_grad()
+    def __call__(
+        self,
+        prompt: Union[str, List[str]],
+        negative_prompt: Optional[Union[str, List[str]]] = None,
+        image: Union[torch.FloatTensor, PIL.Image.Image] = None,
+        mask_image: Union[torch.FloatTensor, PIL.Image.Image] = None,
+        height: int = 512,
+        width: int = 512,
+        num_inference_steps: int = 50,
+        guidance_scale: float = 7.5,
+        strength: float = 0.8,
+        num_images_per_prompt: Optional[int] = 1,
+        eta: float = 0.0,
+        generator: Optional[torch.Generator] = None,
+        latents: Optional[torch.FloatTensor] = None,
+        max_embeddings_multiples: Optional[int] = 3,
+        output_type: Optional[str] = "pil",
+        return_dict: bool = True,
+        controlnet: sdxl_original_control_net.SdxlControlNet = None,
+        controlnet_image=None,
+        callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
+        is_cancelled_callback: Optional[Callable[[], bool]] = None,
+        callback_steps: int = 1,
+    ):
+        r"""
+        Function invoked when calling the pipeline for generation.
+
+        Args:
+            prompt (`str` or `List[str]`):
+                The prompt or prompts to guide the image generation.
+            negative_prompt (`str` or `List[str]`, *optional*):
+                The prompt or prompts not to guide the image generation. Ignored when not using guidance (i.e., ignored
+                if `guidance_scale` is less than `1`).
+            image (`torch.FloatTensor` or `PIL.Image.Image`):
+                `Image`, or tensor representing an image batch, that will be used as the starting point for the
+                process.
+            mask_image (`torch.FloatTensor` or `PIL.Image.Image`):
+                `Image`, or tensor representing an image batch, to mask `image`. White pixels in the mask will be
+                replaced by noise and therefore repainted, while black pixels will be preserved. If `mask_image` is a
+                PIL image, it will be converted to a single channel (luminance) before use. If it's a tensor, it should
+                contain one color channel (L) instead of 3, so the expected shape would be `(B, H, W, 1)`.
+            height (`int`, *optional*, defaults to 512):
+                The height in pixels of the generated image.
+            width (`int`, *optional*, defaults to 512):
+                The width in pixels of the generated image.
+            num_inference_steps (`int`, *optional*, defaults to 50):
+                The number of denoising steps. More denoising steps usually lead to a higher quality image at the
+                expense of slower inference.
+            guidance_scale (`float`, *optional*, defaults to 7.5):
+                Guidance scale as defined in [Classifier-Free Diffusion Guidance](https://arxiv.org/abs/2207.12598).
+                `guidance_scale` is defined as `w` of equation 2. of [Imagen
+                Paper](https://arxiv.org/pdf/2205.11487.pdf). Guidance scale is enabled by setting `guidance_scale >
+                1`. Higher guidance scale encourages to generate images that are closely linked to the text `prompt`,
+                usually at the expense of lower image quality.
+            strength (`float`, *optional*, defaults to 0.8):
+                Conceptually, indicates how much to transform the reference `image`. Must be between 0 and 1.
+                `image` will be used as a starting point, adding more noise to it the larger the `strength`. The
+                number of denoising steps depends on the amount of noise initially added. When `strength` is 1, added
+                noise will be maximum and the denoising process will run for the full number of iterations specified in
+                `num_inference_steps`. A value of 1, therefore, essentially ignores `image`.
+            num_images_per_prompt (`int`, *optional*, defaults to 1):
+                The number of images to generate per prompt.
+            eta (`float`, *optional*, defaults to 0.0):
+                Corresponds to parameter eta (η) in the DDIM paper: https://arxiv.org/abs/2010.02502. Only applies to
+                [`schedulers.DDIMScheduler`], will be ignored for others.
+            generator (`torch.Generator`, *optional*):
+                A [torch generator](https://pytorch.org/docs/stable/generated/torch.Generator.html) to make generation
+                deterministic.
+            latents (`torch.FloatTensor`, *optional*):
+                Pre-generated noisy latents, sampled from a Gaussian distribution, to be used as inputs for image
+                generation. Can be used to tweak the same generation with different prompts. If not provided, a latents
+                tensor will ge generated by sampling using the supplied random `generator`.
+            max_embeddings_multiples (`int`, *optional*, defaults to `3`):
+                The max multiple length of prompt embeddings compared to the max output length of text encoder.
+            output_type (`str`, *optional*, defaults to `"pil"`):
+                The output format of the generate image. Choose between
+                [PIL](https://pillow.readthedocs.io/en/stable/): `PIL.Image.Image` or `np.array`.
+            return_dict (`bool`, *optional*, defaults to `True`):
+                Whether or not to return a [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] instead of a
+                plain tuple.
+            controlnet (`diffusers.ControlNetModel`, *optional*):
+                A controlnet model to be used for the inference. If not provided, controlnet will be disabled.
+            controlnet_image (`torch.FloatTensor` or `PIL.Image.Image`, *optional*):
+                `Image`, or tensor representing an image batch, to be used as the starting point for the controlnet
+                inference.
+            callback (`Callable`, *optional*):
+                A function that will be called every `callback_steps` steps during inference. The function will be
+                called with the following arguments: `callback(step: int, timestep: int, latents: torch.FloatTensor)`.
+            is_cancelled_callback (`Callable`, *optional*):
+                A function that will be called every `callback_steps` steps during inference. If the function returns
+                `True`, the inference will be cancelled.
+            callback_steps (`int`, *optional*, defaults to 1):
+                The frequency at which the `callback` function will be called. If not specified, the callback will be
+                called at every step.
+
+        Returns:
+            `None` if cancelled by `is_cancelled_callback`,
+            [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] or `tuple`:
+            [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] if `return_dict` is True, otherwise a `tuple.
+            When returning a tuple, the first element is a list with the generated images, and the second element is a
+            list of `bool`s denoting whether the corresponding generated image likely represents "not-safe-for-work"
+            (nsfw) content, according to the `safety_checker`.
+        """
+        if controlnet is not None and controlnet_image is None:
+            raise ValueError("controlnet_image must be provided if controlnet is not None.")
+
+        # 0. Default height and width to unet
+        height = height or self.unet.config.sample_size * self.vae_scale_factor
+        width = width or self.unet.config.sample_size * self.vae_scale_factor
+
+        # 1. Check inputs. Raise error if not correct
+        self.check_inputs(prompt, height, width, strength, callback_steps)
+
+        # 2. Define call parameters
+        batch_size = 1 if isinstance(prompt, str) else len(prompt)
+        device = self._execution_device
+        # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
+        # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
+        # corresponds to doing no classifier free guidance.
+        do_classifier_free_guidance = guidance_scale > 1.0
+
+        # 3. Encode input prompt
+        tokenize_strategy: strategy_sdxl.SdxlTokenizeStrategy = strategy_base.TokenizeStrategy.get_strategy()
+        encoding_strategy: strategy_sdxl.SdxlTextEncodingStrategy = strategy_base.TextEncodingStrategy.get_strategy()
+
+        text_input_ids, text_weights = tokenize_strategy.tokenize_with_weights(prompt)
+        hidden_states_1, hidden_states_2, text_pool = encoding_strategy.encode_tokens_with_weights(
+            tokenize_strategy, self.text_encoders, text_input_ids, text_weights
+        )
+        text_embeddings = torch.cat([hidden_states_1, hidden_states_2], dim=-1)
+
+        if do_classifier_free_guidance:
+            input_ids, weights = tokenize_strategy.tokenize_with_weights(negative_prompt or "")
+            hidden_states_1, hidden_states_2, uncond_pool = encoding_strategy.encode_tokens_with_weights(
+                tokenize_strategy, self.text_encoders, input_ids, weights
+            )
+            uncond_embeddings = torch.cat([hidden_states_1, hidden_states_2], dim=-1)
+        else:
+            uncond_embeddings = None
+            uncond_pool = None
+
+        unet_dtype = self.unet.dtype
+        dtype = unet_dtype
+        if hasattr(dtype, "itemsize") and dtype.itemsize == 1:  # fp8
+            dtype = torch.float16
+            self.unet.to(dtype)
+
+        # 4. Preprocess image and mask
+        if isinstance(image, PIL.Image.Image):
+            image = preprocess_image(image)
+        if image is not None:
+            image = image.to(device=self.device, dtype=dtype)
+        if isinstance(mask_image, PIL.Image.Image):
+            mask_image = preprocess_mask(mask_image, self.vae_scale_factor)
+        if mask_image is not None:
+            mask = mask_image.to(device=self.device, dtype=dtype)
+            mask = torch.cat([mask] * batch_size * num_images_per_prompt)
+        else:
+            mask = None
+
+        # ControlNet is not working yet in SDXL, but keep the code here for future use
+        if controlnet_image is not None:
+            controlnet_image = prepare_controlnet_image(
+                controlnet_image, width, height, batch_size, 1, self.device, controlnet.dtype, do_classifier_free_guidance, False
+            )
+
+        # 5. set timesteps
+        self.scheduler.set_timesteps(num_inference_steps, device=device)
+        timesteps, num_inference_steps = self.get_timesteps(num_inference_steps, strength, device, image is None)
+        latent_timestep = timesteps[:1].repeat(batch_size * num_images_per_prompt)
+
+        # 6. Prepare latent variables
+        latents, init_latents_orig, noise = self.prepare_latents(
+            image,
+            latent_timestep,
+            batch_size * num_images_per_prompt,
+            height,
+            width,
+            dtype,
+            device,
+            generator,
+            latents,
+        )
+
+        # 7. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
+        extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
+
+        # create size embs and concat embeddings for SDXL
+        orig_size = torch.tensor([height, width]).repeat(batch_size * num_images_per_prompt, 1).to(device, dtype)
+        crop_size = torch.zeros_like(orig_size)
+        target_size = orig_size
+        embs = sdxl_train_util.get_size_embeddings(orig_size, crop_size, target_size, device).to(device, dtype)
+
+        # make conditionings
+        text_pool = text_pool.to(device, dtype)
+        if do_classifier_free_guidance:
+            text_embedding = torch.cat([uncond_embeddings, text_embeddings]).to(device, dtype)
+
+            uncond_pool = uncond_pool.to(device, dtype)
+            cond_vector = torch.cat([text_pool, embs], dim=1).to(dtype)
+            uncond_vector = torch.cat([uncond_pool, embs], dim=1).to(dtype)
+            vector_embedding = torch.cat([uncond_vector, cond_vector])
+        else:
+            text_embedding = text_embeddings.to(device, dtype)
+            vector_embedding = torch.cat([text_pool, embs], dim=1)
+
+        # 8. Denoising loop
+        for i, t in enumerate(self.progress_bar(timesteps)):
+            # expand the latents if we are doing classifier free guidance
+            latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+            latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+
+            # FIXME SD1 ControlNet is not working
+
+            # predict the noise residual
+            if controlnet is not None:
+                input_resi_add, mid_add = controlnet(latent_model_input, t, text_embedding, vector_embedding, controlnet_image)
+                noise_pred = self.unet(latent_model_input, t, text_embedding, vector_embedding, input_resi_add, mid_add)
+            else:
+                noise_pred = self.unet(latent_model_input, t, text_embedding, vector_embedding)
+            noise_pred = noise_pred.to(dtype)  # U-Net changes dtype in LoRA training
+
+            # perform guidance
+            if do_classifier_free_guidance:
+                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+            # compute the previous noisy sample x_t -> x_t-1
+            latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
+
+            if mask is not None:
+                # masking
+                init_latents_proper = self.scheduler.add_noise(init_latents_orig, noise, torch.tensor([t]))
+                latents = (init_latents_proper * mask) + (latents * (1 - mask))
+
+            # call the callback, if provided
+            if i % callback_steps == 0:
+                if callback is not None:
+                    callback(i, t, latents)
+                if is_cancelled_callback is not None and is_cancelled_callback():
+                    return None
+
+        self.unet.to(unet_dtype)
+        return latents
+
+    def latents_to_image(self, latents):
+        # 9. Post-processing
+        image = self.decode_latents(latents.to(self.vae.dtype))
+        image = self.numpy_to_pil(image)
+        return image
+
+    # copy from pil_utils.py
+    def numpy_to_pil(self, images: np.ndarray) -> Image.Image:
+        """
+        Convert a numpy image or a batch of images to a PIL image.
+        """
+        if images.ndim == 3:
+            images = images[None, ...]
+        images = (images * 255).round().astype("uint8")
+        if images.shape[-1] == 1:
+            # special case for grayscale (single channel) images
+            pil_images = [Image.fromarray(image.squeeze(), mode="L") for image in images]
+        else:
+            pil_images = [Image.fromarray(image) for image in images]
+
+        return pil_images
+
+    def text2img(
+        self,
+        prompt: Union[str, List[str]],
+        negative_prompt: Optional[Union[str, List[str]]] = None,
+        height: int = 512,
+        width: int = 512,
+        num_inference_steps: int = 50,
+        guidance_scale: float = 7.5,
+        num_images_per_prompt: Optional[int] = 1,
+        eta: float = 0.0,
+        generator: Optional[torch.Generator] = None,
+        latents: Optional[torch.FloatTensor] = None,
+        max_embeddings_multiples: Optional[int] = 3,
+        output_type: Optional[str] = "pil",
+        return_dict: bool = True,
+        callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
+        is_cancelled_callback: Optional[Callable[[], bool]] = None,
+        callback_steps: int = 1,
+    ):
+        r"""
+        Function for text-to-image generation.
+        Args:
+            prompt (`str` or `List[str]`):
+                The prompt or prompts to guide the image generation.
+            negative_prompt (`str` or `List[str]`, *optional*):
+                The prompt or prompts not to guide the image generation. Ignored when not using guidance (i.e., ignored
+                if `guidance_scale` is less than `1`).
+            height (`int`, *optional*, defaults to 512):
+                The height in pixels of the generated image.
+            width (`int`, *optional*, defaults to 512):
+                The width in pixels of the generated image.
+            num_inference_steps (`int`, *optional*, defaults to 50):
+                The number of denoising steps. More denoising steps usually lead to a higher quality image at the
+                expense of slower inference.
+            guidance_scale (`float`, *optional*, defaults to 7.5):
+                Guidance scale as defined in [Classifier-Free Diffusion Guidance](https://arxiv.org/abs/2207.12598).
+                `guidance_scale` is defined as `w` of equation 2. of [Imagen
+                Paper](https://arxiv.org/pdf/2205.11487.pdf). Guidance scale is enabled by setting `guidance_scale >
+                1`. Higher guidance scale encourages to generate images that are closely linked to the text `prompt`,
+                usually at the expense of lower image quality.
+            num_images_per_prompt (`int`, *optional*, defaults to 1):
+                The number of images to generate per prompt.
+            eta (`float`, *optional*, defaults to 0.0):
+                Corresponds to parameter eta (η) in the DDIM paper: https://arxiv.org/abs/2010.02502. Only applies to
+                [`schedulers.DDIMScheduler`], will be ignored for others.
+            generator (`torch.Generator`, *optional*):
+                A [torch generator](https://pytorch.org/docs/stable/generated/torch.Generator.html) to make generation
+                deterministic.
+            latents (`torch.FloatTensor`, *optional*):
+                Pre-generated noisy latents, sampled from a Gaussian distribution, to be used as inputs for image
+                generation. Can be used to tweak the same generation with different prompts. If not provided, a latents
+                tensor will ge generated by sampling using the supplied random `generator`.
+            max_embeddings_multiples (`int`, *optional*, defaults to `3`):
+                The max multiple length of prompt embeddings compared to the max output length of text encoder.
+            output_type (`str`, *optional*, defaults to `"pil"`):
+                The output format of the generate image. Choose between
+                [PIL](https://pillow.readthedocs.io/en/stable/): `PIL.Image.Image` or `np.array`.
+            return_dict (`bool`, *optional*, defaults to `True`):
+                Whether or not to return a [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] instead of a
+                plain tuple.
+            callback (`Callable`, *optional*):
+                A function that will be called every `callback_steps` steps during inference. The function will be
+                called with the following arguments: `callback(step: int, timestep: int, latents: torch.FloatTensor)`.
+            is_cancelled_callback (`Callable`, *optional*):
+                A function that will be called every `callback_steps` steps during inference. If the function returns
+                `True`, the inference will be cancelled.
+            callback_steps (`int`, *optional*, defaults to 1):
+                The frequency at which the `callback` function will be called. If not specified, the callback will be
+                called at every step.
+        Returns:
+            [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] or `tuple`:
+            [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] if `return_dict` is True, otherwise a `tuple.
+            When returning a tuple, the first element is a list with the generated images, and the second element is a
+            list of `bool`s denoting whether the corresponding generated image likely represents "not-safe-for-work"
+            (nsfw) content, according to the `safety_checker`.
+        """
+        return self.__call__(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            height=height,
+            width=width,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            num_images_per_prompt=num_images_per_prompt,
+            eta=eta,
+            generator=generator,
+            latents=latents,
+            max_embeddings_multiples=max_embeddings_multiples,
+            output_type=output_type,
+            return_dict=return_dict,
+            callback=callback,
+            is_cancelled_callback=is_cancelled_callback,
+            callback_steps=callback_steps,
+        )
+
+    def img2img(
+        self,
+        image: Union[torch.FloatTensor, PIL.Image.Image],
+        prompt: Union[str, List[str]],
+        negative_prompt: Optional[Union[str, List[str]]] = None,
+        strength: float = 0.8,
+        num_inference_steps: Optional[int] = 50,
+        guidance_scale: Optional[float] = 7.5,
+        num_images_per_prompt: Optional[int] = 1,
+        eta: Optional[float] = 0.0,
+        generator: Optional[torch.Generator] = None,
+        max_embeddings_multiples: Optional[int] = 3,
+        output_type: Optional[str] = "pil",
+        return_dict: bool = True,
+        callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
+        is_cancelled_callback: Optional[Callable[[], bool]] = None,
+        callback_steps: int = 1,
+    ):
+        r"""
+        Function for image-to-image generation.
+        Args:
+            image (`torch.FloatTensor` or `PIL.Image.Image`):
+                `Image`, or tensor representing an image batch, that will be used as the starting point for the
+                process.
+            prompt (`str` or `List[str]`):
+                The prompt or prompts to guide the image generation.
+            negative_prompt (`str` or `List[str]`, *optional*):
+                The prompt or prompts not to guide the image generation. Ignored when not using guidance (i.e., ignored
+                if `guidance_scale` is less than `1`).
+            strength (`float`, *optional*, defaults to 0.8):
+                Conceptually, indicates how much to transform the reference `image`. Must be between 0 and 1.
+                `image` will be used as a starting point, adding more noise to it the larger the `strength`. The
+                number of denoising steps depends on the amount of noise initially added. When `strength` is 1, added
+                noise will be maximum and the denoising process will run for the full number of iterations specified in
+                `num_inference_steps`. A value of 1, therefore, essentially ignores `image`.
+            num_inference_steps (`int`, *optional*, defaults to 50):
+                The number of denoising steps. More denoising steps usually lead to a higher quality image at the
+                expense of slower inference. This parameter will be modulated by `strength`.
+            guidance_scale (`float`, *optional*, defaults to 7.5):
+                Guidance scale as defined in [Classifier-Free Diffusion Guidance](https://arxiv.org/abs/2207.12598).
+                `guidance_scale` is defined as `w` of equation 2. of [Imagen
+                Paper](https://arxiv.org/pdf/2205.11487.pdf). Guidance scale is enabled by setting `guidance_scale >
+                1`. Higher guidance scale encourages to generate images that are closely linked to the text `prompt`,
+                usually at the expense of lower image quality.
+            num_images_per_prompt (`int`, *optional*, defaults to 1):
+                The number of images to generate per prompt.
+            eta (`float`, *optional*, defaults to 0.0):
+                Corresponds to parameter eta (η) in the DDIM paper: https://arxiv.org/abs/2010.02502. Only applies to
+                [`schedulers.DDIMScheduler`], will be ignored for others.
+            generator (`torch.Generator`, *optional*):
+                A [torch generator](https://pytorch.org/docs/stable/generated/torch.Generator.html) to make generation
+                deterministic.
+            max_embeddings_multiples (`int`, *optional*, defaults to `3`):
+                The max multiple length of prompt embeddings compared to the max output length of text encoder.
+            output_type (`str`, *optional*, defaults to `"pil"`):
+                The output format of the generate image. Choose between
+                [PIL](https://pillow.readthedocs.io/en/stable/): `PIL.Image.Image` or `np.array`.
+            return_dict (`bool`, *optional*, defaults to `True`):
+                Whether or not to return a [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] instead of a
+                plain tuple.
+            callback (`Callable`, *optional*):
+                A function that will be called every `callback_steps` steps during inference. The function will be
+                called with the following arguments: `callback(step: int, timestep: int, latents: torch.FloatTensor)`.
+            is_cancelled_callback (`Callable`, *optional*):
+                A function that will be called every `callback_steps` steps during inference. If the function returns
+                `True`, the inference will be cancelled.
+            callback_steps (`int`, *optional*, defaults to 1):
+                The frequency at which the `callback` function will be called. If not specified, the callback will be
+                called at every step.
+        Returns:
+            [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] or `tuple`:
+            [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] if `return_dict` is True, otherwise a `tuple.
+            When returning a tuple, the first element is a list with the generated images, and the second element is a
+            list of `bool`s denoting whether the corresponding generated image likely represents "not-safe-for-work"
+            (nsfw) content, according to the `safety_checker`.
+        """
+        return self.__call__(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            image=image,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            strength=strength,
+            num_images_per_prompt=num_images_per_prompt,
+            eta=eta,
+            generator=generator,
+            max_embeddings_multiples=max_embeddings_multiples,
+            output_type=output_type,
+            return_dict=return_dict,
+            callback=callback,
+            is_cancelled_callback=is_cancelled_callback,
+            callback_steps=callback_steps,
+        )
+
+    def inpaint(
+        self,
+        image: Union[torch.FloatTensor, PIL.Image.Image],
+        mask_image: Union[torch.FloatTensor, PIL.Image.Image],
+        prompt: Union[str, List[str]],
+        negative_prompt: Optional[Union[str, List[str]]] = None,
+        strength: float = 0.8,
+        num_inference_steps: Optional[int] = 50,
+        guidance_scale: Optional[float] = 7.5,
+        num_images_per_prompt: Optional[int] = 1,
+        eta: Optional[float] = 0.0,
+        generator: Optional[torch.Generator] = None,
+        max_embeddings_multiples: Optional[int] = 3,
+        output_type: Optional[str] = "pil",
+        return_dict: bool = True,
+        callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
+        is_cancelled_callback: Optional[Callable[[], bool]] = None,
+        callback_steps: int = 1,
+    ):
+        r"""
+        Function for inpaint.
+        Args:
+            image (`torch.FloatTensor` or `PIL.Image.Image`):
+                `Image`, or tensor representing an image batch, that will be used as the starting point for the
+                process. This is the image whose masked region will be inpainted.
+            mask_image (`torch.FloatTensor` or `PIL.Image.Image`):
+                `Image`, or tensor representing an image batch, to mask `image`. White pixels in the mask will be
+                replaced by noise and therefore repainted, while black pixels will be preserved. If `mask_image` is a
+                PIL image, it will be converted to a single channel (luminance) before use. If it's a tensor, it should
+                contain one color channel (L) instead of 3, so the expected shape would be `(B, H, W, 1)`.
+            prompt (`str` or `List[str]`):
+                The prompt or prompts to guide the image generation.
+            negative_prompt (`str` or `List[str]`, *optional*):
+                The prompt or prompts not to guide the image generation. Ignored when not using guidance (i.e., ignored
+                if `guidance_scale` is less than `1`).
+            strength (`float`, *optional*, defaults to 0.8):
+                Conceptually, indicates how much to inpaint the masked area. Must be between 0 and 1. When `strength`
+                is 1, the denoising process will be run on the masked area for the full number of iterations specified
+                in `num_inference_steps`. `image` will be used as a reference for the masked area, adding more
+                noise to that region the larger the `strength`. If `strength` is 0, no inpainting will occur.
+            num_inference_steps (`int`, *optional*, defaults to 50):
+                The reference number of denoising steps. More denoising steps usually lead to a higher quality image at
+                the expense of slower inference. This parameter will be modulated by `strength`, as explained above.
+            guidance_scale (`float`, *optional*, defaults to 7.5):
+                Guidance scale as defined in [Classifier-Free Diffusion Guidance](https://arxiv.org/abs/2207.12598).
+                `guidance_scale` is defined as `w` of equation 2. of [Imagen
+                Paper](https://arxiv.org/pdf/2205.11487.pdf). Guidance scale is enabled by setting `guidance_scale >
+                1`. Higher guidance scale encourages to generate images that are closely linked to the text `prompt`,
+                usually at the expense of lower image quality.
+            num_images_per_prompt (`int`, *optional*, defaults to 1):
+                The number of images to generate per prompt.
+            eta (`float`, *optional*, defaults to 0.0):
+                Corresponds to parameter eta (η) in the DDIM paper: https://arxiv.org/abs/2010.02502. Only applies to
+                [`schedulers.DDIMScheduler`], will be ignored for others.
+            generator (`torch.Generator`, *optional*):
+                A [torch generator](https://pytorch.org/docs/stable/generated/torch.Generator.html) to make generation
+                deterministic.
+            max_embeddings_multiples (`int`, *optional*, defaults to `3`):
+                The max multiple length of prompt embeddings compared to the max output length of text encoder.
+            output_type (`str`, *optional*, defaults to `"pil"`):
+                The output format of the generate image. Choose between
+                [PIL](https://pillow.readthedocs.io/en/stable/): `PIL.Image.Image` or `np.array`.
+            return_dict (`bool`, *optional*, defaults to `True`):
+                Whether or not to return a [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] instead of a
+                plain tuple.
+            callback (`Callable`, *optional*):
+                A function that will be called every `callback_steps` steps during inference. The function will be
+                called with the following arguments: `callback(step: int, timestep: int, latents: torch.FloatTensor)`.
+            is_cancelled_callback (`Callable`, *optional*):
+                A function that will be called every `callback_steps` steps during inference. If the function returns
+                `True`, the inference will be cancelled.
+            callback_steps (`int`, *optional*, defaults to 1):
+                The frequency at which the `callback` function will be called. If not specified, the callback will be
+                called at every step.
+        Returns:
+            [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] or `tuple`:
+            [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] if `return_dict` is True, otherwise a `tuple.
+            When returning a tuple, the first element is a list with the generated images, and the second element is a
+            list of `bool`s denoting whether the corresponding generated image likely represents "not-safe-for-work"
+            (nsfw) content, according to the `safety_checker`.
+        """
+        return self.__call__(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            image=image,
+            mask_image=mask_image,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            strength=strength,
+            num_images_per_prompt=num_images_per_prompt,
+            eta=eta,
+            generator=generator,
+            max_embeddings_multiples=max_embeddings_multiples,
+            output_type=output_type,
+            return_dict=return_dict,
+            callback=callback,
+            is_cancelled_callback=is_cancelled_callback,
+            callback_steps=callback_steps,
+        )
+
+
