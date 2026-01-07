@@ -7,14 +7,16 @@ from . import strategy_base, flux_utils
 class FluxTokenizeStrategy(strategy_base.TokenizeStrategy):
     def __init__(self, t5_xxl_max_token_length: int = 512, tokenizer_cache_dir: Optional[str] = None):
         self.t5_xxl_max_token_length = t5_xxl_max_token_length
-        self.clip_tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14", max_length=77)
-        self.t5_tokenizer = T5Tokenizer.from_pretrained("google/t5-v1_1-xxl", max_length=t5_xxl_max_token_length)
+        # VULCAN FIX: Renamed attributes to match what train_network.py expects
+        self.clip_l = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14", max_length=77)
+        self.t5xxl = T5Tokenizer.from_pretrained("google/t5-v1_1-xxl", max_length=t5_xxl_max_token_length)
 
     def tokenize(self, text: str | List[str]) -> List[Any]:
         if isinstance(text, str):
             text = [text]
-        clip_tokens = self.clip_tokenizer(text, padding="max_length", max_length=77, truncation=True, return_tensors="pt")
-        t5_tokens = self.t5_tokenizer(text, padding="max_length", max_length=self.t5_xxl_max_token_length, truncation=True, return_tensors="pt")
+        # Use the renamed attributes
+        clip_tokens = self.clip_l(text, padding="max_length", max_length=77, truncation=True, return_tensors="pt")
+        t5_tokens = self.t5xxl(text, padding="max_length", max_length=self.t5_xxl_max_token_length, truncation=True, return_tensors="pt")
         return [clip_tokens, t5_tokens]
 
 class FluxTextEncodingStrategy(strategy_base.TextEncodingStrategy):
@@ -35,7 +37,6 @@ class FluxTextEncodingStrategy(strategy_base.TextEncodingStrategy):
         txt = t5_enc.last_hidden_state
         return [vec, txt]
 
-# --- VULCAN FIX: Added 's' to Latents to match base class ---
 class FluxLatentsCachingStrategy(strategy_base.LatentsCachingStrategy):
     def __init__(self, cache_to_disk: bool = False, batch_size: int = 1, num_workers: int = 1):
         super().__init__(cache_to_disk, batch_size, num_workers)
