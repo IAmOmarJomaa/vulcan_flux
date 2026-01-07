@@ -57,43 +57,40 @@ def load_flow_model(ckpt_path: str, dtype, device, disable_mmap=False, model_typ
     
     if model_type == "flux":
         is_diffusers, is_schnell, (num_double_blocks, num_single_blocks), ckpt_paths = analyze_checkpoint_state(ckpt_path)
-        
-        # Map to the keys used in flux_models.py configs
         name = "dev" if not is_schnell else "schnell"
         
         logger.info(f"Building Flux model '{name}' from {'Diffusers' if is_diffusers else 'BFL'} checkpoint")
         
         with torch.device("meta"):
-            # Load the params from the factory
             params = flux_models.configs[name]
-            
-            # Build the empty shell
             model = flux_models.Flux(params)
-            
             if dtype is not None:
                 model = model.to(dtype)
 
         logger.info(f"Loading state dict from {ckpt_path}")
         sd = {}
         for p in ckpt_paths:
-            sd.update(load_safetensors(p, device=device, disable_mmap=disable_mmap, dtype=dtype))
+            # VULCAN FIX: Only pass arguments guaranteed to work
+            loaded_tensors = load_safetensors(p, device=device)
+            sd.update(loaded_tensors)
 
         if is_diffusers:
             logger.info("Converting Diffusers to BFL")
             sd = convert_diffusers_sd_to_bfl(sd, num_double_blocks, num_single_blocks)
 
-        # Sanitize keys: Remove "model.diffusion_model." prefix if it exists
         keys_to_rename = [k for k in sd.keys() if k.startswith("model.diffusion_model.")]
         for key in keys_to_rename:
             new_key = key.replace("model.diffusion_model.", "")
             sd[new_key] = sd.pop(key)
         
-        if keys_to_rename:
-            logger.info(f"Sanitized {len(keys_to_rename)} keys.")
-
-        # Load weights into the shell
+        # Load and cast manually if needed
         info = model.load_state_dict(sd, strict=False, assign=True)
         logger.info(f"Loaded Flux: {info}")
+        
+        # Ensure correct dtype after loading
+        if dtype is not None:
+            model = model.to(dtype)
+            
         return is_schnell, model
 
     raise NotImplementedError(f"Model type {model_type} not implemented")
