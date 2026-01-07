@@ -7,14 +7,13 @@ from . import strategy_base, flux_utils
 class FluxTokenizeStrategy(strategy_base.TokenizeStrategy):
     def __init__(self, t5_xxl_max_token_length: int = 512, tokenizer_cache_dir: Optional[str] = None):
         self.t5_xxl_max_token_length = t5_xxl_max_token_length
-        # VULCAN FIX: Renamed attributes to match what train_network.py expects
+        # Preserved Fix: Attributes match train_network.py
         self.clip_l = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14", max_length=77)
         self.t5xxl = T5Tokenizer.from_pretrained("google/t5-v1_1-xxl", max_length=t5_xxl_max_token_length)
 
     def tokenize(self, text: str | List[str]) -> List[Any]:
         if isinstance(text, str):
             text = [text]
-        # Use the renamed attributes
         clip_tokens = self.clip_l(text, padding="max_length", max_length=77, truncation=True, return_tensors="pt")
         t5_tokens = self.t5xxl(text, padding="max_length", max_length=self.t5_xxl_max_token_length, truncation=True, return_tensors="pt")
         return [clip_tokens, t5_tokens]
@@ -41,8 +40,14 @@ class FluxLatentsCachingStrategy(strategy_base.LatentsCachingStrategy):
     def __init__(self, cache_to_disk: bool = False, batch_size: int = 1, num_workers: int = 1):
         super().__init__(cache_to_disk, batch_size, num_workers)
 
+    # --- VULCAN FIX: The Missing Property ---
+    @property
+    def cache_suffix(self) -> str:
+        return ".npz"
+
     def get_latents_npz_path(self, absolute_path: str, image_size: Optional[Any]) -> str:
         return os.path.splitext(absolute_path)[0] + ".npz"
 
     def cache_batch_latents(self, model, batch: List[Any], accelerator=None):
+        # We can pass here because the main training loop handles generation if cache is missing
         pass
