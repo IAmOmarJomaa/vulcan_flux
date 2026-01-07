@@ -15,18 +15,15 @@ class FluxParams:
     qkv_bias: bool = True
     guidance_embed: bool = True
 
-# ... (EmbedND, MLPEmbedder, RMSNorm, QKNorm classes are standard, keep them or use the versions below) ...
-
 class EmbedND(nn.Module):
     def __init__(self, dim: int, theta: int, axes_dim: list[int]):
         super().__init__()
         self.dim = dim
         self.theta = theta
         self.axes_dim = axes_dim
-    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+    def forward(self, ids):
         n_axes = len(self.axes_dim)
-        emb = torch.cat([nn.functional.embedding(ids[..., i], self.create_embedding(i)) for i in range(n_axes)], dim=-1)
-        return emb.unsqueeze(1)
+        return torch.cat([nn.functional.embedding(ids[..., i], self.create_embedding(i)) for i in range(n_axes)], dim=-1).unsqueeze(1)
     def create_embedding(self, idx):
         return torch.randn(self.axes_dim[idx], self.dim // len(self.axes_dim))
 
@@ -36,25 +33,23 @@ class MLPEmbedder(nn.Module):
         self.in_layer = nn.Linear(in_dim, hidden_dim, bias=True)
         self.silu = nn.SiLU()
         self.out_layer = nn.Linear(hidden_dim, hidden_dim, bias=True)
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         return self.out_layer(self.silu(self.in_layer(x)))
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
         self.scale = nn.Parameter(torch.ones(dim))
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_dtype = x.dtype
-        x = x.float()
-        rrms = torch.rsqrt(torch.mean(x**2, dim=-1, keepdim=True) + 1e-6)
-        return (x * rrms).to(dtype=x_dtype) * self.scale
+    def forward(self, x):
+        rrms = torch.rsqrt(torch.mean(x.float()**2, dim=-1, keepdim=True) + 1e-6)
+        return (x.float() * rrms).to(dtype=x.dtype) * self.scale
 
 class QKNorm(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
         self.query_norm = RMSNorm(dim)
         self.key_norm = RMSNorm(dim)
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, q, k, v):
         return self.query_norm(q), self.key_norm(k)
 
 class DoubleStreamBlock(nn.Module):
@@ -62,13 +57,8 @@ class DoubleStreamBlock(nn.Module):
         super().__init__()
         self.num_heads = num_heads
         self.hidden_size = hidden_size
-        
-        # VULCAN FIX: Naming layers 'lin' to match checkpoint keys
-        self.img_mod = nn.Module()
-        self.img_mod.lin = nn.Linear(hidden_size, 6 * hidden_size, bias=True)
-        self.txt_mod = nn.Module()
-        self.txt_mod.lin = nn.Linear(hidden_size, 6 * hidden_size, bias=True)
-        
+        self.img_mod = nn.Module(); self.img_mod.lin = nn.Linear(hidden_size, 6 * hidden_size, bias=True)
+        self.txt_mod = nn.Module(); self.txt_mod.lin = nn.Linear(hidden_size, 6 * hidden_size, bias=True)
         self.img_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.txt_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.img_attn_qkv = nn.Linear(hidden_size, 3 * hidden_size, bias=qkv_bias)
@@ -77,18 +67,9 @@ class DoubleStreamBlock(nn.Module):
         self.txt_attn_proj = nn.Linear(hidden_size, hidden_size, bias=qkv_bias)
         self.img_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.txt_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.img_mlp = nn.Sequential(
-            nn.Linear(hidden_size, int(hidden_size * mlp_ratio), bias=True),
-            nn.GELU(approximate="tanh"),
-            nn.Linear(int(hidden_size * mlp_ratio), hidden_size, bias=True)
-        )
-        self.txt_mlp = nn.Sequential(
-            nn.Linear(hidden_size, int(hidden_size * mlp_ratio), bias=True),
-            nn.GELU(approximate="tanh"),
-            nn.Linear(int(hidden_size * mlp_ratio), hidden_size, bias=True)
-        )
-    def forward(self, img, txt, vec, pe):
-        return img, txt
+        self.img_mlp = nn.Sequential(nn.Linear(hidden_size, int(hidden_size * mlp_ratio), bias=True), nn.GELU(approximate="tanh"), nn.Linear(int(hidden_size * mlp_ratio), hidden_size, bias=True))
+        self.txt_mlp = nn.Sequential(nn.Linear(hidden_size, int(hidden_size * mlp_ratio), bias=True), nn.GELU(approximate="tanh"), nn.Linear(int(hidden_size * mlp_ratio), hidden_size, bias=True))
+    def forward(self, img, txt, vec, pe): return img, txt
 
 class SingleStreamBlock(nn.Module):
     def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float, qkv_bias: bool = False):
@@ -97,13 +78,10 @@ class SingleStreamBlock(nn.Module):
         self.num_heads = num_heads
         self.mlp_hidden_dim = int(hidden_size * mlp_ratio)
         self.linear1 = nn.Linear(hidden_size, hidden_size * 3 + self.mlp_hidden_dim, bias=qkv_bias)
-        # VULCAN FIX: 15360 dimension match
         self.linear2 = nn.Linear(self.mlp_hidden_dim + hidden_size, hidden_size, bias=qkv_bias)
         self.norm = QKNorm(hidden_size // num_heads)
-        self.modulation = nn.Module()
-        self.modulation.lin = nn.Linear(hidden_size, 3 * hidden_size, bias=True)
-    def forward(self, x, vec, pe):
-        return x
+        self.modulation = nn.Module(); self.modulation.lin = nn.Linear(hidden_size, 3 * hidden_size, bias=True)
+    def forward(self, x, vec, pe): return x
 
 class LastLayer(nn.Module):
     def __init__(self, hidden_size: int, patch_size: int, out_channels: int):
@@ -111,8 +89,7 @@ class LastLayer(nn.Module):
         self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
         self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size, bias=True))
-    def forward(self, x, vec):
-        return self.linear(self.norm_final(x))
+    def forward(self, x, vec): return self.linear(self.norm_final(x))
 
 class Flux(nn.Module):
     def __init__(self, params: FluxParams):
@@ -128,10 +105,8 @@ class Flux(nn.Module):
         self.double_blocks = nn.ModuleList([DoubleStreamBlock(params.hidden_size, params.num_heads, params.mlp_ratio, params.qkv_bias) for _ in range(params.depth)])
         self.single_blocks = nn.ModuleList([SingleStreamBlock(params.hidden_size, params.num_heads, params.mlp_ratio, params.qkv_bias) for _ in range(params.depth_single_blocks)])
         self.final_layer = LastLayer(params.hidden_size, 1, self.out_channels)
-    def forward(self, x):
-        pass
+    def forward(self, x): pass
 
-# VULCAN FIX: Config keys must match what flux_utils.py asks for ("dev", "schnell")
 configs = {
     "dev": FluxParams(depth=19, depth_single_blocks=38, num_heads=24, hidden_size=3072, in_channels=64, vec_in_dim=768, context_dim=4096, mlp_ratio=4.0, qkv_bias=True, guidance_embed=True),
     "schnell": FluxParams(depth=19, depth_single_blocks=38, num_heads=24, hidden_size=3072, in_channels=64, vec_in_dim=768, context_dim=4096, mlp_ratio=4.0, qkv_bias=True, guidance_embed=True),
