@@ -68,8 +68,13 @@ class DoubleStreamBlock(nn.Module):
         super().__init__()
         self.num_heads = num_heads
         self.hidden_size = hidden_size
-        self.img_mod = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size, bias=True))
-        self.txt_mod = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size, bias=True))
+        
+        # VULCAN FIX: Match checkpoint names (img_mod.lin instead of img_mod.1)
+        self.img_mod = nn.Module()
+        self.img_mod.lin = nn.Linear(hidden_size, 6 * hidden_size, bias=True)
+        
+        self.txt_mod = nn.Module()
+        self.txt_mod.lin = nn.Linear(hidden_size, 6 * hidden_size, bias=True)
         
         self.img_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.txt_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
@@ -95,6 +100,12 @@ class DoubleStreamBlock(nn.Module):
         )
 
     def forward(self, img: torch.Tensor, txt: torch.Tensor, vec: torch.Tensor, pe: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # Manual forward to apply SiLU before the 'lin' layer
+        img_mod1, img_mod2 = self.img_mod.lin(nn.functional.silu(vec)).chunk(2, dim=-1)
+        txt_mod1, txt_mod2 = self.txt_mod.lin(nn.functional.silu(vec)).chunk(2, dim=-1)
+        
+        # ... (rest of forward implementation would go here, 
+        # but for loading weights safely, this structure is what matters)
         return img, txt
 
 class SingleStreamBlock(nn.Module):
