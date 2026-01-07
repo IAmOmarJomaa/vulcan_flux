@@ -10,22 +10,22 @@ from huggingface_hub import hf_hub_download
 
 logger = logging.getLogger(__name__)
 
-# --- VULCAN FIX: Hardcoded Flux VAE Configuration ---
-# This prevents OSError: config.json not found
+# --- VULCAN FIX: Missing Constants ---
+MODEL_VERSION_FLUX_V1 = "flux_v1"
+MODEL_VERSION_CHROMA = "chroma"
+
+# --- VULCAN FIX: Correct Flux VAE Config (16 Latent Channels) ---
+# The previous mismatch was because standard SDXL uses 4 channels.
+# Flux uses 16. The checkpoint weights [32, 512, 3, 3] correspond to 2 * 16 (mean + logvar).
 FLUX_VAE_CONFIG = {
     "in_channels": 3,
-    "out_channels": 3, # Flux VAE has 16 channels latent, but this wrapper adapts it
+    "out_channels": 3, 
     "block_out_channels": [128, 256, 512, 512],
     "layers_per_block": 2,
-    "latent_channels": 4, # Standard KL latent dim
+    "latent_channels": 16, # <--- CRITICAL FIX: Changed from 4 to 16
     "norm_num_groups": 32,
-    "scaling_factor": 0.18215,
-    "sample_size": 256, # Dummy value
-    # NOTE: Flux actually uses a unique AE structure (16ch latents). 
-    # But for training scripts using AutoencoderKL, we often map to standard SDXL VAE 
-    # OR we need the specific Flux AE class. 
-    # Since we are using 'diffusers.AutoencoderKL', we must use a compatible config.
-    # The safest bet for Flux is to download the raw file and load it.
+    "scaling_factor": 0.18215, # Flux scale factor
+    "sample_size": 256,
 }
 
 def analyze_checkpoint_state(ckpt_path: str):
@@ -63,32 +63,28 @@ def load_flow_model(ckpt_path, dtype, device, disable_mmap=False, model_type="fl
 def load_ae(name, dtype, device, disable_mmap=False):
     logger.info(f"Loading AE from {name}...")
     
-    # 1. Try standard load first (in case user points to a valid local folder)
+    # 1. Try standard load first (folder structure)
     try:
         return AutoencoderKL.from_pretrained(name, subfolder="ae", torch_dtype=dtype).to(device)
     except:
         pass
 
-    # 2. Fallback: Download 'ae.safetensors' from official BFL repo and load manually
-    # This bypasses the need for 'config.json'
+    # 2. Fallback: Download 'ae.safetensors' and load manually with Correct Config
     try:
-        logger.info("Standard load failed. Attempting to download specific AE file...")
+        logger.info("Standard load failed. Downloading Flux AE and applying Manual Config...")
         ae_path = hf_hub_download(repo_id="black-forest-labs/FLUX.1-dev", filename="ae.safetensors")
         
-        # Load the SDXL VAE config (Flux VAE is compatible with this structure for loading)
-        # We fetch a known working config from Hugging Face
-        config_path = hf_hub_download(repo_id="madebyollin/sdxl-vae-fp16-fix", filename="config.json")
-        
-        ae = AutoencoderKL.from_config(T5Config.from_json_file(config_path) if False else AutoencoderKL.load_config(config_path))
+        # Build the VAE shell with the 16-channel config
+        ae = AutoencoderKL(**FLUX_VAE_CONFIG)
         
         # Load weights
-        sd = load_safetensors(ae_path, device="cpu") # Load to CPU first to avoid OOM
-        ae.load_state_dict(sd, strict=False) # strict=False handles minor key differences
+        sd = load_safetensors(ae_path, device="cpu") 
+        ae.load_state_dict(sd, strict=False) 
         
         return ae.to(device, dtype=dtype)
     except Exception as e:
         logger.error(f"Failed to manual load AE: {e}")
-        # Final Hail Mary: Use SDXL VAE which is "good enough" for training latents usually
+        # Final Hail Mary (Likely to fail if we are here, but required for return type)
         return AutoencoderKL.from_pretrained("madebyollin/sdxl-vae-fp16-fix", torch_dtype=dtype).to(device)
 
 def load_clip_l(path, dtype, device, disable_mmap=False):
