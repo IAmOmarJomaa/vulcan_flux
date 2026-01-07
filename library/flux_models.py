@@ -57,6 +57,7 @@ class DoubleStreamBlock(nn.Module):
         super().__init__()
         self.num_heads = num_heads
         self.hidden_size = hidden_size
+        # VULCAN FIX: Using nn.Module + lin to match checkpoint keys (img_mod.lin)
         self.img_mod = nn.Module(); self.img_mod.lin = nn.Linear(hidden_size, 6 * hidden_size, bias=True)
         self.txt_mod = nn.Module(); self.txt_mod.lin = nn.Linear(hidden_size, 6 * hidden_size, bias=True)
         self.img_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
@@ -78,6 +79,7 @@ class SingleStreamBlock(nn.Module):
         self.num_heads = num_heads
         self.mlp_hidden_dim = int(hidden_size * mlp_ratio)
         self.linear1 = nn.Linear(hidden_size, hidden_size * 3 + self.mlp_hidden_dim, bias=qkv_bias)
+        # VULCAN FIX: 15360 dimension match for Single Stream Blocks
         self.linear2 = nn.Linear(self.mlp_hidden_dim + hidden_size, hidden_size, bias=qkv_bias)
         self.norm = QKNorm(hidden_size // num_heads)
         self.modulation = nn.Module(); self.modulation.lin = nn.Linear(hidden_size, 3 * hidden_size, bias=True)
@@ -107,6 +109,7 @@ class Flux(nn.Module):
         self.final_layer = LastLayer(params.hidden_size, 1, self.out_channels)
     def forward(self, x): pass
 
+# - Config keys must match what flux_utils.py asks for ("dev", "schnell")
 configs = {
     "dev": FluxParams(depth=19, depth_single_blocks=38, num_heads=24, hidden_size=3072, in_channels=64, vec_in_dim=768, context_dim=4096, mlp_ratio=4.0, qkv_bias=True, guidance_embed=True),
     "schnell": FluxParams(depth=19, depth_single_blocks=38, num_heads=24, hidden_size=3072, in_channels=64, vec_in_dim=768, context_dim=4096, mlp_ratio=4.0, qkv_bias=True, guidance_embed=True),
