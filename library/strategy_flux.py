@@ -3,6 +3,7 @@ import torch
 import numpy as np
 from typing import Any, List, Optional, Tuple
 from transformers import CLIPTokenizer, T5Tokenizer
+from PIL import Image # VULCAN FIX: Switched to PIL for safety
 from . import strategy_base, flux_utils
 
 class FluxTokenizeStrategy(strategy_base.TokenizeStrategy):
@@ -41,23 +42,16 @@ class FluxLatentsCachingStrategy(strategy_base.LatentsCachingStrategy):
         return ".npz"
 
     def get_latents_npz_path(self, absolute_path: str, image_size: Optional[Any]) -> str:
-        # VULCAN FIX: Defensive check for corrupted paths
-        if not isinstance(absolute_path, str):
-            return ""
+        if not isinstance(absolute_path, str): return ""
         return os.path.splitext(absolute_path)[0] + ".npz"
 
-    # VULCAN FIX: Duck Typing to handle argument mix-ups in train_util.py
     def is_disk_cached_latents_expected(self, *args, **kwargs) -> bool:
-        # Scan args for the string path (ignoring booleans)
         absolute_path = None
         for arg in args:
             if isinstance(arg, str) and (os.path.exists(arg) or os.path.isabs(arg)):
                 absolute_path = arg
                 break
-        
-        if absolute_path is None:
-            return False # Can't find path, assume not cached
-            
+        if absolute_path is None: return False
         return os.path.exists(self.get_latents_npz_path(absolute_path, None))
 
     def load_latents_from_disk(self, absolute_path: str, image_size: Tuple[int, int]) -> Any:
@@ -65,44 +59,39 @@ class FluxLatentsCachingStrategy(strategy_base.LatentsCachingStrategy):
         data = np.load(npz_path)
         return torch.from_numpy(data['latents'])
 
-    # VULCAN FIX: Real VAE Encoding Implementation
-    def cache_batch_latents(self, model, batch: List[Any], accelerator=None):
-        # batch is list of ImageInfo objects or tuples.
-        # We need to extract images, encode, and save.
-        # Since we are inside the training loop, 'model' is likely the VAE.
-        
-        # If model is None or batch is empty, skip
-        if model is None or not batch:
-            return
+    # --- VULCAN FIX: Signature updated to accept *args (flip, alpha, etc) ---
+    def cache_batch_latents(self, model, batch: List[Any], *args, **kwargs):
+        if model is None or not batch: return
 
         device = model.device
         dtype = model.dtype
 
         for info in batch:
-            # Handle the messed up ImageInfo object if needed
-            image_path = info.absolute_path if isinstance(info.absolute_path, str) else None
-            if image_path is None: continue
+            # Handle possible object types
+            image_path = getattr(info, 'absolute_path', None)
+            if image_path is None and isinstance(info, str): image_path = info
+            
+            if not image_path or not os.path.exists(image_path): continue
 
-            # Load image manually
-            import cv2
-            img = cv2.imread(image_path)
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            
-            # Preprocess (Simple resize/crop to target bucket size)
-            # Note: A full implementation would use the bucket size info. 
-            # For robustness, we resize to the nearest 32 multiple of the original size or target info.
-            h, w = img.shape[:2]
-            target_w, target_h = info.image_size if info.image_size else (w, h)
-            
-            # Normalize to [-1, 1]
-            img_tensor = torch.from_numpy(img).float() / 127.5 - 1.0
-            img_tensor = img_tensor.permute(2, 0, 1).unsqueeze(0).to(device, dtype)
-            
-            # Encode
-            with torch.no_grad():
-                latents = model.encode(img_tensor).latent_dist.sample()
-            
-            # Save
-            npz_path = self.get_latents_npz_path(image_path, None)
-            np.savez(npz_path, latents=latents.float().cpu().numpy())
-            print(f"Cached: {npz_path}")
+            # Load and Preprocess
+            try:
+                img = Image.open(image_path).convert("RGB")
+                # Basic resize to target bucket size if available in info
+                target_size = getattr(info, 'image_size', None)
+                if target_size:
+                    img = img.resize(target_size, Image.LANCZOS)
+                
+                # To Tensor [-1, 1]
+                img_np = np.array(img).astype(np.float32) / 127.5 - 1.0
+                img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).to(device, dtype)
+                
+                # Encode
+                with torch.no_grad():
+                    latents = model.encode(img_tensor).latent_dist.sample()
+                
+                # Save
+                npz_path = self.get_latents_npz_path(image_path, None)
+                np.savez(npz_path, latents=latents.float().cpu().numpy())
+                # print(f"Cached: {npz_path}") # Uncomment for debug
+            except Exception as e:
+                print(f"Failed to cache {image_path}: {e}")
