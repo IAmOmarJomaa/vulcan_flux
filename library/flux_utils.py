@@ -1,101 +1,70 @@
 import torch
-from typing import Tuple, List
 import os
+import logging
 from safetensors.torch import load_file as load_safetensors
 from . import flux_models
-import logging
-# - Using raw transformers models
+# - The critical fix: AutoencoderKL lives in diffusers
+from diffusers import AutoencoderKL
 from transformers import CLIPTextModel, CLIPConfig, T5EncoderModel, T5Config
-# - AutoencoderKL comes from DIFFUSERS, not transformers
-from diffusers import AutoencoderKL 
 from huggingface_hub import hf_hub_download
 
 logger = logging.getLogger(__name__)
 
-# Constants
-MODEL_NAME_DEV = "black-forest-labs/FLUX.1-dev"
-MODEL_NAME_SCHNELL = "black-forest-labs/FLUX.1-schnell"
-
-# Placeholder to satisfy any stray imports, though NotebookLM says we shouldn't need it.
 def convert_diffusers_sd_to_bfl(sd, num_double_blocks, num_single_blocks):
     return sd
 
-def analyze_checkpoint_state(ckpt_path: str) -> Tuple[bool, bool, Tuple[int, int], List[str]]:
+def analyze_checkpoint_state(ckpt_path: str):
     if not os.path.exists(ckpt_path) and not os.path.exists(os.path.join(ckpt_path, "transformer")):
-        logger.info(f"'{ckpt_path}' not found locally. Attempting HF download...")
         try:
             if "FLUX.1" in ckpt_path:
-                target_file = "flux1-dev.safetensors" if "dev" in ckpt_path else "flux1-schnell.safetensors"
-                ckpt_path = hf_hub_download(repo_id=ckpt_path, filename=target_file)
-                logger.info(f"Downloaded to: {ckpt_path}")
-        except Exception as e:
-            logger.warning(f"Download attempt failed: {e}")
-
-    ckpt_path = ckpt_path.strip('"').strip("'")
-    if os.path.isdir(ckpt_path):
-        return True, False, (19, 38), []
-    else:
-        is_schnell = "schnell" in os.path.basename(ckpt_path)
-        return False, is_schnell, (19, 38), [ckpt_path]
-
-def load_flow_model(ckpt_path: str, dtype, device, disable_mmap=False, model_type="flux"):
-    ckpt_path = ckpt_path.strip('"').strip("'")
+                target = "flux1-dev.safetensors" if "dev" in ckpt_path else "flux1-schnell.safetensors"
+                ckpt_path = hf_hub_download(repo_id=ckpt_path, filename=target)
+        except Exception: pass
     
-    if model_type == "flux":
-        is_diffusers, is_schnell, (num_double, num_single), paths = analyze_checkpoint_state(ckpt_path)
-        name = "dev" if not is_schnell else "schnell"
+    ckpt_path = ckpt_path.strip('"').strip("'")
+    if os.path.isdir(ckpt_path): return True, False, (19, 38), []
+    is_schnell = "schnell" in os.path.basename(ckpt_path)
+    return False, is_schnell, (19, 38), [ckpt_path]
+
+def load_flow_model(ckpt_path, dtype, device, disable_mmap=False, model_type="flux"):
+    is_diffusers, is_schnell, (num_double, num_single), paths = analyze_checkpoint_state(ckpt_path)
+    name = "dev" if not is_schnell else "schnell"
+    
+    with torch.device("meta"):
+        model = flux_models.Flux(flux_models.configs[name]).to(dtype)
+    
+    sd = {}
+    for p in paths:
+        # - Removing disable_mmap which crashes on Kaggle
+        sd.update(load_safetensors(p, device=device))
         
-        logger.info(f"Building Flux model '{name}'...")
-        with torch.device("meta"):
-            params = flux_models.configs[name]
-            model = flux_models.Flux(params)
-            if dtype is not None:
-                model = model.to(dtype)
+    keys_to_rename = [k for k in sd.keys() if k.startswith("model.diffusion_model.")]
+    for key in keys_to_rename:
+        sd[key.replace("model.diffusion_model.", "")] = sd.pop(key)
 
-        logger.info(f"Loading state dict from {ckpt_path}")
-        sd = {}
-        for p in paths:
-            # - load_file from safetensors.torch
-            sd.update(load_safetensors(p, device=device))
+    model.load_state_dict(sd, strict=False, assign=True)
+    return is_schnell, model
 
-        keys_to_rename = [k for k in sd.keys() if k.startswith("model.diffusion_model.")]
-        for key in keys_to_rename:
-            new_key = key.replace("model.diffusion_model.", "")
-            sd[new_key] = sd.pop(key)
-        
-        info = model.load_state_dict(sd, strict=False, assign=True)
-        logger.info(f"Loaded Flux: {info}")
-        return is_schnell, model
-
-    raise NotImplementedError(f"Model type {model_type} not implemented")
-
-# - Loading Logic for VAE
+# - The Missing Function that killed your run
 def load_ae(name, dtype, device, disable_mmap=False):
     logger.info(f"Loading AE from {name}...")
     try:
         # Standard loading from Diffusers library
-        ae = AutoencoderKL.from_pretrained(name, subfolder="ae", torch_dtype=dtype).to(device)
+        return AutoencoderKL.from_pretrained(name, subfolder="ae", torch_dtype=dtype).to(device)
     except:
         # Fallback for flat repositories
-        ae = AutoencoderKL.from_pretrained(name, subfolder=None, torch_dtype=dtype).to(device)
-    return ae
+        return AutoencoderKL.from_pretrained(name, subfolder=None, torch_dtype=dtype).to(device)
 
-# - Custom Text Encoder Loading
 def load_clip_l(path, dtype, device, disable_mmap=False):
-    if path is None:
-        path = "openai/clip-vit-large-patch14"
-    logger.info(f"Building CLIP-L from {path}")
+    if path is None: path = "openai/clip-vit-large-patch14"
     try:
         return CLIPTextModel.from_pretrained(path, torch_dtype=dtype).to(device)
     except:
-        # Robust fallback with fixed max_position_embeddings
         config = CLIPConfig(vocab_size=49408, hidden_size=768, intermediate_size=3072, num_hidden_layers=12, num_attention_heads=12, max_position_embeddings=77, hidden_act="quick_gelu")
         return CLIPTextModel(config).to(device, dtype=dtype)
 
 def load_t5xxl(path, dtype, device, disable_mmap=False):
-    if path is None:
-        path = "google/t5-v1_1-xxl"
-    logger.info(f"Building T5-XXL from {path}")
+    if path is None: path = "google/t5-v1_1-xxl"
     try:
         return T5EncoderModel.from_pretrained(path, torch_dtype=dtype).to(device)
     except:
